@@ -1,3 +1,716 @@
+import datetime
+import math
+import altair as alt
+import folium
+import pandas as pd
+import requests
+import streamlit as st
+from streamlit_folium import st_folium
+from xml.etree import ElementTree as ET
+
+st.set_page_config(
+    page_title="ROADRIC - Road-Trip Moto",
+    page_icon="🏍️",
+    layout="wide",
+)
+
+st.title("🏍️ ROADRIC — Générateur de Road-Trip Moto")
+
+# -----------------------------------------------------------------------------
+# FONCTIONS DE GÉOCODAGE ET CALCULS
+# -----------------------------------------------------------------------------
+def haversine_distance(coord1, coord2):
+    R = 6371000
+    lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
+    lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+@st.cache_data(ttl=86400)
+def geocode_ville_details(nom_ville):
+    """Géocodage ciblé sur les communes françaises."""
+    if not nom_ville or not nom_ville.strip():
+        return None, {}
+
+    url_ban = "https://api-adresse.data.gouv.fr/search/"
+    params_ban = {"q": nom_ville.strip(), "type": "municipality", "limit": 1}
+
+    try:
+        resp = requests.get(url_ban, params=params_ban, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            features = data.get("features", [])
+            if features:
+                coords = features[0]["geometry"]["coordinates"]
+                props = features[0]["properties"]
+
+                nom_trouve = props.get("city", props.get("label", ""))
+                code_dept = props.get("context", "")
+                postcode = props.get("postcode", "")
+
+                label_affiche = f"{nom_trouve} ({postcode[:2]})" if postcode else nom_trouve
+
+                details = {
+                    "nom": nom_trouve,
+                    "postcode": postcode,
+                    "departement": code_dept,
+                    "label": label_affiche,
+                    "lat": coords[1],
+                    "lon": coords[0]
+                }
+
+                return (coords[1], coords[0]), details
+    except Exception:
+        pass
+
+    return None, {}
+
+
+def nommer_coordonnee(lat, lon):
+    """Trouve la commune la plus proche pour une coordonnée donnée."""
+    url = f"https://api-adresse.data.gouv.fr/reverse/?lon={lon}&lat={lat}"
+    try:
+        resp = requests.get(url, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            features = data.get("features", [])
+            if features:
+                props = features[0]["properties"]
+                city = props.get("city", props.get("nom", "Secteur inconnu"))
+                dept = props.get("postcode", "")[:2]
+                return f"{city} ({dept})" if dept else city
+    except Exception:
+        pass
+    return f"Secteur {lat:.2f}, {lon:.2f}"
+
+
+# -----------------------------------------------------------------------------
+# ROUTING & DÉCOUPE DES PAUSES / STATIONS TOUS LES 200 KM
+# -----------------------------------------------------------------------------
+def router_sans_autoroute(waypoints, zones_a_eviter=None):
+    """Itinéraire BRouter, sans autoroutes ni voies express assimilées."""
+    url = "https://brouter.de/brouter"
+    params = {
+        "lonlats": "|".join(f"{lon},{lat}" for lat, lon in waypoints),
+        "profile": "car-eco",
+        "alternativeidx": 0,
+        "format": "geojson",
+        # Le profil car-eco traite aussi les voies motorroad=yes comme à éviter.
+        "profile:avoid_motorways": 1,
+    }
+    if zones_a_eviter:
+        # -1 crée une zone infranchissable ; les extrémités restent toutefois
+        # utilisables comme départ et arrivée par BRouter.
+        params["nogos"] = "|".join(
+            f"{lon},{lat},{rayon_m},-1" for lat, lon, rayon_m in zones_a_eviter
+        )
+
+    erreurs = []
+    for _ in range(2):
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": "ROADRIC/1.0"},
+                timeout=45,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("features"):
+                return None, 0, 0, "BRouter n'a trouvé aucun itinéraire compatible."
+
+            feature = data["features"][0]
+            geometry = feature["geometry"]["coordinates"]
+            props = feature["properties"]
+            coords = [(pt[1], pt[0]) for pt in geometry]
+            return (
+                coords,
+                float(props["track-length"]) / 1000.0,
+                float(props["total-time"]) / 60.0,
+                None,
+            )
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            erreurs.append(str(exc))
+
+    return None, 0, 0, "BRouter est temporairement indisponible. Réessayez dans un instant."
+
+
+def point_a_distance(lat, lon, distance_km, cap_deg):
+    """Calcule un point à une distance et un cap donnés depuis le départ."""
+    rayon_terre_km = 6371.0
+    distance_angulaire = distance_km / rayon_terre_km
+    cap = math.radians(cap_deg)
+    lat1, lon1 = math.radians(lat), math.radians(lon)
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(distance_angulaire)
+        + math.cos(lat1) * math.sin(distance_angulaire) * math.cos(cap)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(cap) * math.sin(distance_angulaire) * math.cos(lat1),
+        math.cos(distance_angulaire) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+@st.cache_data(ttl=86400)
+def chercher_villes_a_eviter(lat, lon, rayon_m):
+    """Retourne des zones d'évitement pour les villes et bourgs proches."""
+    query = f'''[out:json][timeout:20];
+    node["place"~"city|town"](around:{rayon_m},{lat},{lon});
+    out tags;'''
+    try:
+        response = requests.get(
+            "https://overpass-api.de/api/interpreter",
+            params={"data": query},
+            headers={"User-Agent": "ROADRIC/1.0"},
+            timeout=35,
+        )
+        response.raise_for_status()
+        zones = []
+        for element in response.json().get("elements", []):
+            tags = element.get("tags", {})
+            # Rayon plus large pour une ville que pour un bourg.
+            rayon_zone = 6000 if tags.get("place") == "city" else 2500
+            zones.append((element["lat"], element["lon"], rayon_zone))
+        return zones[:30]
+    except (requests.RequestException, ValueError, KeyError):
+        return []
+
+
+def calculer_boucle_sans_autoroute(depart, duree_cible_min):
+    """Construit et ajuste un circuit routier autour du point de départ."""
+    # 45 km/h est une moyenne adaptée à une balade sur des routes secondaires.
+    distance_cible_km = duree_cible_min / 60 * 45
+    rayon_km = max(8, min(85, distance_cible_km / 5.6))
+    caps = (25, 115, 205, 295)
+    dernier_resultat = (None, 0, 0, "Impossible de générer la boucle.")
+    villes = chercher_villes_a_eviter(
+        depart[0], depart[1], int(max(25000, min(120000, rayon_km * 1700)))
+    )
+
+    # Une seconde passe ajuste le rayon selon la durée réellement calculée.
+    for _ in range(2):
+        points_intermediaires = [
+            point_a_distance(depart[0], depart[1], rayon_km, cap) for cap in caps
+        ]
+        waypoints = [depart, *points_intermediaires, depart]
+        # Évite que le routeur revienne au départ entre deux points du circuit.
+        rayon_nogo_m = int(max(3500, min(20000, rayon_km * 700)))
+        dernier_resultat = router_sans_autoroute(
+            waypoints,
+            zones_a_eviter=[(depart[0], depart[1], rayon_nogo_m), *villes],
+        )
+        coords, _, duree_min, erreur = dernier_resultat
+        if erreur or not duree_min:
+            break
+        if abs(duree_min - duree_cible_min) <= 12:
+            break
+        rayon_km = max(8, min(85, rayon_km * duree_cible_min / duree_min))
+
+    return dernier_resultat
+
+
+def creer_gpx(coords, nom="Roadric - Road-trip moto"):
+    """Construit un fichier GPX téléchargeable à partir du tracé calculé."""
+    gpx = ET.Element(
+        "gpx",
+        {
+            "version": "1.1",
+            "creator": "ROADRIC",
+            "xmlns": "http://www.topografix.com/GPX/1/1",
+        },
+    )
+    trk = ET.SubElement(gpx, "trk")
+    ET.SubElement(trk, "name").text = nom
+    segment = ET.SubElement(trk, "trkseg")
+
+    for lat, lon in coords:
+        ET.SubElement(segment, "trkpt", {"lat": str(lat), "lon": str(lon)})
+
+    return ET.tostring(gpx, encoding="utf-8", xml_declaration=True)
+
+
+def calculer_étapes_pauses_et_plein(coords, dist_totale_km, duree_min_totale, heure_dep, intervalle_plein_km=200):
+    """
+    Calcule les points d'arrêt pour :
+    - Pauses carburant tous les X km (200km par défaut)
+    - Pause café (~toutes les 1h30 de roulage)
+    - Pause repas STRICTEMENT programmée si le trajet franchit la plage 12h00-13h00
+    """
+    if not coords or len(coords) < 2:
+        return [], []
+
+    etapes_pauses = []
+    stations_recommandees = []
+
+    cumul_dist = 0.0
+    dernier_plein_km = 0.0
+    prochain_cafe_km = 90.0
+    repas_place = False
+
+    dt_dep = datetime.datetime.combine(datetime.date.today(), heure_dep)
+
+    for i in range(1, len(coords)):
+        d = haversine_distance(coords[i-1], coords[i]) / 1000.0
+        cumul_dist += d
+
+        ratio_progression = cumul_dist / dist_totale_km
+        minutes_ecoulees = ratio_progression * duree_min_totale
+        dt_estime = dt_dep + datetime.timedelta(minutes=minutes_ecoulees)
+
+        # PAUSE REPAS STRICTEMENT ENTRE 12H ET 13H
+        if (12 <= dt_estime.hour < 13) and not repas_place:
+            pt = coords[i]
+            nom_lieu = nommer_coordonnee(pt[0], pt[1])
+            etapes_pauses.append({
+                "type": "🍽️ Pause Repas (12h - 13h)",
+                "km": round(cumul_dist, 1),
+                "heure_estimee": dt_estime.strftime("%Hh%M"),
+                "lieu": nom_lieu,
+                "lat": pt[0],
+                "lon": pt[1]
+            })
+            repas_place = True
+            prochain_cafe_km = cumul_dist + 100.0
+
+        # PAUSE CAFÉ / DÉTENTE
+        elif cumul_dist >= prochain_cafe_km and cumul_dist < (dist_totale_km - 20):
+            if not (11 <= dt_estime.hour < 12 and dt_estime.minute >= 45):
+                pt = coords[i]
+                nom_lieu = nommer_coordonnee(pt[0], pt[1])
+                etapes_pauses.append({
+                    "type": "☕ Pause Café / Détente",
+                    "km": round(cumul_dist, 1),
+                    "heure_estimee": dt_estime.strftime("%Hh%M"),
+                    "lieu": nom_lieu,
+                    "lat": pt[0],
+                    "lon": pt[1]
+                })
+                prochain_cafe_km = cumul_dist + 90.0
+
+    return etapes_pauses, stations_recommandees
+
+
+def obtenir_denivele_et_virages(coords):
+    if not coords or len(coords) < 3:
+        return 0, 0, 0, []
+
+    step = max(1, len(coords) // 50)
+    sampled_coords = coords[::step]
+    if coords[-1] not in sampled_coords:
+        sampled_coords.append(coords[-1])
+
+    locations = [{"latitude": lat, "longitude": lon} for lat, lon in sampled_coords]
+
+    denivele_pos = 0
+    denivele_neg = 0
+    elevations = []
+
+    try:
+        resp = requests.post(
+            "https://api.open-elevation.com/api/v1/lookup",
+            json={"locations": locations},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            elevations = [r["elevation"] for r in results]
+
+            for i in range(1, len(elevations)):
+                diff = elevations[i] - elevations[i - 1]
+                if diff > 0:
+                    denivele_pos += diff
+                else:
+                    denivele_neg += abs(diff)
+    except Exception:
+        pass
+
+    virages_count = 0
+    for i in range(len(coords) - 2):
+        lat1, lon1 = coords[i]
+        lat2, lon2 = coords[i + 1]
+        lat3, lon3 = coords[i + 2]
+
+        angle1 = math.atan2(lat2 - lat1, lon2 - lon1)
+        angle2 = math.atan2(lat3 - lat2, lon3 - lon2)
+        diff_deg = abs(math.degrees(angle2 - angle1))
+
+        if 25 < diff_deg < 160:
+            virages_count += 1
+
+    pct_virages = min(100, int((virages_count / len(coords)) * 100 * 2.5))
+
+    return denivele_pos, denivele_neg, pct_virages, elevations
+
+
+def chercher_pistes_trail_overpass(center_lat, center_lon, rayon_m=15000):
+    query = f"""
+    [out:json][timeout:8];
+    (
+      way["highway"="track"](around:{rayon_m},{center_lat},{center_lon});
+      way["surface"~"unpaved|compacted|gravel|dirt|earth"](around:{rayon_m},{center_lat},{center_lon});
+    );
+    out body geom 30;
+    """
+    url = "https://overpass-api.de/api/interpreter"
+    try:
+        resp = requests.post(url, data={"data": query}, timeout=8)
+        if resp.status_code == 200:
+            elements = resp.json().get("elements", [])
+            pistes_coords = []
+            for el in elements:
+                if "geometry" in el:
+                    piste = [(pt["lat"], pt["lon"]) for pt in el["geometry"]]
+                    pistes_coords.append(piste)
+            return pistes_coords
+    except Exception:
+        pass
+    return []
+
+
+def chercher_stations_essence_overpass(coords, rayon_m=8000, intervalle_km=12):
+    """Recherche de vraies stations-service OpenStreetMap près du tracé."""
+    if not coords:
+        return [], "Tracé indisponible pour rechercher des stations."
+
+    # Échantillonne le tracé pour garder une requête Overpass raisonnable.
+    points = [coords[0]]
+    distance = 0.0
+    for i in range(1, len(coords)):
+        distance += haversine_distance(coords[i - 1], coords[i]) / 1000
+        if distance >= intervalle_km:
+            points.append(coords[i])
+            distance = 0.0
+    if points[-1] != coords[-1]:
+        points.append(coords[-1])
+
+    zones = "".join(
+        f'nwr["amenity"="fuel"](around:{rayon_m},{lat},{lon});'
+        for lat, lon in points[:70]
+    )
+    # L'ordre `tags center` est important dans la syntaxe Overpass.
+    query = f"[out:json][timeout:25];({zones});out tags center;"
+    data = None
+    erreurs = []
+    for url in (
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ):
+        try:
+            # L'instance publique principale accepte plus fiablement les
+            # requêtes Overpass en GET ; POST peut répondre 406 sans résultat.
+            response = requests.get(
+                url,
+                params={"data": query},
+                headers={"User-Agent": "ROADRIC/1.0"},
+                timeout=45,
+            )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except (requests.RequestException, ValueError) as exc:
+            erreurs.append(str(exc))
+
+    if data is None:
+        return [], "La recherche des stations est temporairement indisponible (Overpass)."
+
+    stations, vus = [], set()
+    for element in data.get("elements", []):
+        identifiant = (element.get("type"), element.get("id"))
+        if identifiant in vus:
+            continue
+        vus.add(identifiant)
+
+        centre = element.get("center", element)
+        lat, lon = centre.get("lat"), centre.get("lon")
+        if lat is None or lon is None:
+            continue
+
+        tags = element.get("tags", {})
+        stations.append({
+            "nom": tags.get("name") or tags.get("brand") or "Station-service",
+            "marque": tags.get("brand", ""),
+            "adresse": " ".join(filter(None, [
+                tags.get("addr:housenumber"),
+                tags.get("addr:street"),
+                tags.get("addr:postcode"),
+                tags.get("addr:city"),
+            ])),
+            "horaires": tags.get("opening_hours", "Horaires non renseignés"),
+            "lat": lat,
+            "lon": lon,
+        })
+    if not stations:
+        return [], "Aucune station OpenStreetMap trouvée à moins de 8 km du tracé."
+    return stations, None
+
+
+def positionner_stations_sur_trajet(stations, coords):
+    """Ajoute le kilométrage de trajet et l'écart au tracé à chaque station."""
+    cumul = [0.0]
+    for i in range(1, len(coords)):
+        cumul.append(cumul[-1] + haversine_distance(coords[i - 1], coords[i]) / 1000)
+
+    resultat = []
+    for station in stations:
+        index_proche, distance_min = min(
+            (
+                (i, haversine_distance((station["lat"], station["lon"]), point) / 1000)
+                for i, point in enumerate(coords)
+            ),
+            key=lambda item: item[1],
+        )
+        station = station.copy()
+        station["km"] = round(cumul[index_proche], 1)
+        station["ecart_route_km"] = round(distance_min, 1)
+        resultat.append(station)
+    return resultat
+
+
+def recommander_stations(stations, distance_totale_km, autonomie_km):
+    """Choisit des vraies stations atteignables avant chaque plein."""
+    stations = sorted(stations, key=lambda station: station["km"])
+    recommandations, alertes = [], []
+    dernier_plein = 0.0
+
+    while distance_totale_km - dernier_plein > autonomie_km:
+        limite = dernier_plein + autonomie_km
+        accessibles = [
+            station for station in stations
+            if dernier_plein + 5 < station["km"] <= limite
+        ]
+        if not accessibles:
+            alertes.append(
+                f"Aucune station OSM recensée entre le km {dernier_plein:.0f} "
+                f"et le km {limite:.0f}."
+            )
+            break
+
+        # Priorité à une station vers 80 % du plein, sans compromettre l'étape suivante.
+        objectif = min(
+            limite,
+            max(
+                dernier_plein + autonomie_km * 0.8,
+                distance_totale_km - autonomie_km,
+            ),
+        )
+        station = min(accessibles, key=lambda item: abs(item["km"] - objectif))
+        recommandations.append(station)
+        dernier_plein = station["km"]
+
+    return recommandations, alertes
+
+
+# -----------------------------------------------------------------------------
+# BARRE LATÉRALE
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configuration Itinéraire")
+
+    type_itineraire = st.radio(
+        "🧭 Type d'itinéraire",
+        options=["➡️ Aller simple", "🔁 Balade en boucle"],
+    )
+    categorie = st.radio(
+        "🎯 Mode de Pratique",
+        options=["🛣️ Routière / GT", "🏍️ Trail / Tout-terrain"],
+        help="Le mode Trail affiche en vert les chemins et pistes non goudronnées."
+    )
+
+    ville_depart = st.text_input("📍 Ville de départ (Point A)", "Montbeton")
+    est_boucle = "boucle" in type_itineraire
+    if est_boucle:
+        duree_boucle_h = st.slider(
+            "⏱️ Durée de roulage souhaitée",
+            min_value=1.0,
+            max_value=8.0,
+            value=3.0,
+            step=0.5,
+            help="La durée est une cible : le circuit est ajusté automatiquement au plus près.",
+        )
+        st.caption("Retour au point de départ, par des routes sans autoroutes.")
+        etape_intermediaire = ""
+        ville_arrivee = ville_depart
+    else:
+        duree_boucle_h = None
+        etape_intermediaire = st.text_input("📌 Étape intermédiaire (Optionnel)", "Auch")
+        ville_arrivee = st.text_input("🏁 Ville d'arrivée (Point B)", "Lourdes")
+
+    heure_depart = st.time_input("🕒 Heure de départ", datetime.time(9, 0), step=900)
+    autonomie_km = st.slider("⛽ Autonomie réservoir / Plein (km)", 150, 350, 200, step=10)
+
+    btn_generer = st.button("🚀 Calculer l'Itinéraire", use_container_width=True)
+
+
+# -----------------------------------------------------------------------------
+# CALCUL DE L'ITINÉRAIRE
+# -----------------------------------------------------------------------------
+if btn_generer:
+    with st.spinner("Calcul du tracé, calcul du % de virages et des pauses..."):
+        coords_dep, info_dep = geocode_ville_details(ville_depart)
+        if est_boucle:
+            coords_etape, info_etape = None, {}
+            coords_arr, info_arr = coords_dep, info_dep
+        else:
+            coords_etape, info_etape = (
+                geocode_ville_details(etape_intermediaire)
+                if etape_intermediaire.strip()
+                else (None, {})
+            )
+            coords_arr, info_arr = geocode_ville_details(ville_arrivee)
+
+        villes_non_trouvees = []
+        if not coords_dep:
+            villes_non_trouvees.append(f"Départ ({ville_depart})")
+        if etape_intermediaire.strip() and not coords_etape:
+            villes_non_trouvees.append(f"Étape ({etape_intermediaire})")
+        if not coords_arr:
+            villes_non_trouvees.append(f"Arrivée ({ville_arrivee})")
+
+        if villes_non_trouvees:
+            st.error(f"❌ Impossible de géolocaliser : {', '.join(villes_non_trouvees)}.")
+        else:
+            is_trail = "Trail" in categorie
+            if est_boucle:
+                coords_trace, dist_reelle, duree_min, erreur_routage = calculer_boucle_sans_autoroute(
+                    coords_dep, int(duree_boucle_h * 60)
+                )
+            else:
+                waypoints = [coords_dep]
+                if coords_etape:
+                    waypoints.append(coords_etape)
+                waypoints.append(coords_arr)
+                coords_trace, dist_reelle, duree_min, erreur_routage = router_sans_autoroute(waypoints)
+
+            if coords_trace:
+                d_pos, d_neg, pct_virages, elevations = obtenir_denivele_et_virages(coords_trace)
+
+                pistes_overlay = []
+                if is_trail:
+                    mid_pt = coords_trace[len(coords_trace) // 2]
+                    pistes_overlay = chercher_pistes_trail_overpass(mid_pt[0], mid_pt[1], rayon_m=20000)
+
+                etapes_pauses, _ = calculer_étapes_pauses_et_plein(
+                    coords_trace, dist_reelle, duree_min, heure_depart, intervalle_plein_km=autonomie_km
+                )
+                if dist_reelle > autonomie_km:
+                    stations_osm, erreur_stations = chercher_stations_essence_overpass(coords_trace)
+                    if erreur_stations:
+                        stations_recommandees = []
+                        alertes_carburant = [erreur_stations]
+                    else:
+                        stations_sur_trajet = positionner_stations_sur_trajet(
+                            stations_osm, coords_trace
+                        )
+                        stations_recommandees, alertes_carburant = recommander_stations(
+                            stations_sur_trajet, dist_reelle, autonomie_km
+                        )
+                else:
+                    stations_recommandees, alertes_carburant = [], []
+
+                dt_dep = datetime.datetime.combine(datetime.date.today(), heure_depart)
+                temps_total_min = duree_min + (len(etapes_pauses) * 20) + 45
+                dt_arr = dt_dep + datetime.timedelta(minutes=temps_total_min)
+
+                st.session_state["trajet_resultat"] = {
+                    "coords": coords_trace,
+                    "dist_km": round(dist_reelle, 1),
+                    "duree_roulage": f"{int(duree_min // 60)}h{int(duree_min % 60):02d}",
+                    "heure_arr": dt_arr.strftime("%Hh%M"),
+                    "info_dep": info_dep,
+                    "info_etape": info_etape,
+                    "info_arr": info_arr,
+                    "is_trail": is_trail,
+                    "est_boucle": est_boucle,
+                    "duree_boucle_cible": duree_boucle_h,
+                    "pistes": pistes_overlay,
+                    "coords_etape": coords_etape,
+                    "d_pos": d_pos,
+                    "d_neg": d_neg,
+                    "pct_virages": pct_virages,
+                    "etapes_pauses": etapes_pauses,
+                    "stations_recommandees": stations_recommandees,
+                    "alertes_carburant": alertes_carburant,
+                    "elevations": elevations
+                }
+                st.session_state["gpx_exporte"] = False
+            else:
+                st.error(f"❌ {erreur_routage or 'Impossible de calculer le tracé. Réessayez.'}")
+
+
+# -----------------------------------------------------------------------------
+# AFFICHAGE
+# -----------------------------------------------------------------------------
+if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]:
+    res = st.session_state["trajet_resultat"]
+
+    libelle_type = "Balade en boucle" if res.get("est_boucle") else "Trajet A → B"
+    st.subheader(
+        f"📋 Résumé — {libelle_type} ({'Mode Trail' if res['is_trail'] else 'Mode Routière'})"
+    )
+    if res.get("est_boucle"):
+        st.caption(f"Objectif : environ {res['duree_boucle_cible']:.1f} h de roulage.")
+
+    # Affichage sur 5 colonnes incluant désormais le % de virages
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("📏 Distance Totale", f"{res['dist_km']} km")
+    c2.metric("⏱️ Temps Roulage", res["duree_roulage"])
+    c3.metric("🏁 Arrivée Estimée", res["heure_arr"], help="Inclut les pauses café + repas")
+    c4.metric("🔄 Courbes & Virages", f"{res['pct_virages']}%")
+    c5.metric("🏔️ Dénivelé (+ / -)", f"+{res['d_pos']}m / -{res['d_neg']}m")
+
+    st.markdown("---")
+
+    # TABLEAU DES PAUSES & STATIONS ESSENCE
+    col_p1, col_p2 = st.columns(2)
+
+    with col_p1:
+        st.subheader("☕ / 🍽️ Pauses Programmées")
+        if res["etapes_pauses"]:
+            for p in res["etapes_pauses"]:
+                st.info(f"**{p['type']}** à **{p['heure_estimee']}** (au km {p['km']})\n📍 Lieu : **{p['lieu']}**")
+        else:
+            st.write("Aucune pause intermédiaire nécessaire sur cette courte distance.")
+
+    with col_p2:
+        st.subheader("⛽ Stations-service réelles recommandées")
+        for alerte in res.get("alertes_carburant", []):
+            st.error(f"⚠️ {alerte}")
+
+        if res["stations_recommandees"]:
+            for station in res["stations_recommandees"]:
+                marque = f" — {station['marque']}" if station["marque"] else ""
+                detour = (
+                    f" (à {station['ecart_route_km']} km du tracé)"
+                    if station["ecart_route_km"] else ""
+                )
+                st.warning(
+                    f"**{station['nom']}{marque}** — km **{station['km']}**{detour}\n"
+                    f"📍 {station['adresse'] or 'Adresse non renseignée'}\n"
+                    f"🕒 {station['horaires']}"
+                )
+        elif not res.get("alertes_carburant"):
+            st.success("✅ Trajet réalisable sur un seul plein !")
+
+    st.markdown("---")
+    st.subheader("🗺️ Carte du Parcours et Points d'Arrêt")
+
+    m = folium.Map(location=res["coords"][0], zoom_start=9, tiles="OpenStreetMap")
+
+    folium.PolyLine(locations=res["coords"], color="#0066cc", weight=5, opacity=0.8, popup="Liaison").add_to(m)
+
+    if res["is_trail"] and res["pistes"]:
+        for piste in res["pistes"]:
+            folium.PolyLine(locations=piste, color="#2e7d32", weight=4, opacity=0.9, popup="Piste / Chemin").add_to(m)
+
+    for p in res["etapes_pauses"]:
+        folium.Marker(
             [p["lat"], p["lon"]],
             popup=f"{p['type']} - {p['lieu']} (km {p['km']})",
             icon=folium.Icon(color="blue" if "Café" in p["type"] else "red", icon="coffee" if "Café" in p["type"] else "utensils", prefix="fa")
@@ -6,7 +719,11 @@
     for st_rec in res["stations_recommandees"]:
         folium.Marker(
             [st_rec["lat"], st_rec["lon"]],
-            popup=f"{st_rec['nom']} (km {st_rec['km']})",
+            popup=(
+                f"{st_rec['nom']} — km {st_rec['km']}<br>"
+                f"{st_rec['adresse'] or 'Adresse non renseignée'}<br>"
+                f"{st_rec['horaires']}"
+            ),
             icon=folium.Icon(color="orange", icon="gas-pump", prefix="fa")
         ).add_to(m)
 
@@ -38,3 +755,19 @@
 
 else:
     st.info("👈 Saisissez vos villes dans la barre latérale et cliquez sur **🚀 Calculer l'Itinéraire**.")
+
+
+# Le bloc est créé après le calcul afin que le bouton apparaisse immédiatement
+# lors de l'affichage du résultat, sous le bouton de calcul de la barre latérale.
+if st.session_state.get("trajet_resultat") and not st.session_state.get("gpx_exporte", False):
+    with st.sidebar:
+        export_effectue = st.download_button(
+            "⬇️ Exporter l'itinéraire en GPX",
+            data=creer_gpx(st.session_state["trajet_resultat"]["coords"]),
+            file_name="roadric-itineraire.gpx",
+            mime="application/gpx+xml",
+            use_container_width=True,
+        )
+        if export_effectue:
+            st.session_state["gpx_exporte"] = True
+            st.rerun()
