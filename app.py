@@ -991,9 +991,15 @@ if st.session_state.get("trajet_resultat"):
         )
         lat_guidage, lon_guidage = resultat_gps["coords"][index_guidage]
         st.link_button(
-            "🧭 Essayer d'ouvrir l'application GPS",
-            f"geo:{lat_guidage:.6f},{lon_guidage:.6f}?q={lat_guidage:.6f},{lon_guidage:.6f}",
-            help="Sur téléphone, ce lien ouvre l'application de cartes/navigation associée à l'appareil.",
+            "🧭 Ouvrir dans Plans (iPhone)",
+            f"https://maps.apple.com/?daddr={lat_guidage:.6f},{lon_guidage:.6f}&dirflg=d",
+            help="Ouvre Plans d'Apple avec un itinéraire en voiture depuis votre position actuelle.",
+            use_container_width=True,
+        )
+        st.link_button(
+            "🧭 Ouvrir dans Google Maps (Android)",
+            f"https://www.google.com/maps/dir/?api=1&destination={lat_guidage:.6f},{lon_guidage:.6f}&travelmode=driving",
+            help="Ouvre Google Maps si l'application est installée, sinon le navigateur.",
             use_container_width=True,
         )
         st.caption("Pour suivre tout le tracé, utilisez toujours l'export GPX.")
