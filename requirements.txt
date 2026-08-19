@@ -1,6 +1,4 @@
 streamlit
-requests
-pandas
-folium
 streamlit-folium
-altair
+requests
+streamlit-searchbox
