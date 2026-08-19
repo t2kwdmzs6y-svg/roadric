@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
+from streamlit_searchbox import st_searchbox
 from xml.etree import ElementTree as ET
 
 st.set_page_config(
@@ -34,43 +35,79 @@ def haversine_distance(coord1, coord2):
 
 
 @st.cache_data(ttl=86400)
-def geocode_ville_details(nom_ville):
-    """Géocodage ciblé sur les communes françaises."""
+def rechercher_villes(nom_ville):
+    """Renvoie les communes françaises les plus proches de la saisie."""
     if not nom_ville or not nom_ville.strip():
-        return None, {}
+        return []
 
     url_ban = "https://api-adresse.data.gouv.fr/search/"
-    params_ban = {"q": nom_ville.strip(), "type": "municipality", "limit": 1}
+    params_ban = {"q": nom_ville.strip(), "type": "municipality", "limit": 6}
 
     try:
         resp = requests.get(url_ban, params=params_ban, timeout=3)
         if resp.status_code == 200:
             data = resp.json()
-            features = data.get("features", [])
-            if features:
-                coords = features[0]["geometry"]["coordinates"]
-                props = features[0]["properties"]
+            villes = []
+            for feature in data.get("features", []):
+                coords = feature["geometry"]["coordinates"]
+                props = feature["properties"]
 
                 nom_trouve = props.get("city", props.get("label", ""))
                 code_dept = props.get("context", "")
                 postcode = props.get("postcode", "")
-
                 label_affiche = f"{nom_trouve} ({postcode[:2]})" if postcode else nom_trouve
-
-                details = {
+                villes.append({
                     "nom": nom_trouve,
                     "postcode": postcode,
                     "departement": code_dept,
                     "label": label_affiche,
                     "lat": coords[1],
-                    "lon": coords[0]
-                }
-
-                return (coords[1], coords[0]), details
+                    "lon": coords[0],
+                })
+            return villes
     except Exception:
         pass
 
+    return []
+
+
+def geocode_ville_details(nom_ville):
+    """Géocodage ciblé sur les communes françaises."""
+    villes = rechercher_villes(nom_ville)
+    if villes:
+        details = villes[0]
+        return (details["lat"], details["lon"]), details
     return None, {}
+
+
+def proposer_villes(saisie):
+    """Format attendu par la case d'autocomplétion intégrée."""
+    if len(saisie.strip()) < 3:
+        return []
+    return [
+        (
+            f"{ville['nom']} ({ville['postcode']}) — {ville['departement']}",
+            f"{ville['nom']} {ville['postcode']}",
+        )
+        for ville in rechercher_villes(saisie)
+    ]
+
+
+def saisir_ville_avec_suggestions(libelle, valeur_defaut, cle):
+    """Une seule case : saisie libre et propositions dans sa liste déroulante."""
+    return st_searchbox(
+        proposer_villes,
+        label=libelle,
+        placeholder="Tapez au moins 3 lettres…",
+        default=valeur_defaut,
+        default_searchterm=valeur_defaut,
+        default_use_searchterm=True,
+        clear_on_submit=False,
+        edit_after_submit="option",
+        debounce=250,
+        key=f"{cle}_ville",
+        help="Tapez le nom de la ville puis choisissez une proposition dans cette même case.",
+    )
 
 
 def nommer_coordonnee(lat, lon):
@@ -160,8 +197,8 @@ def obtenir_cle_graphhopper():
         return ""
 
 
-def router_boucle_graphhopper(depart, duree_cible_min):
-    """Génère un circuit natif GraphHopper, plutôt qu'un aller-retour assemblé."""
+def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
+    """Génère un circuit en excluant les autoroutes et grands axes."""
     cle_api = obtenir_cle_graphhopper()
     if not cle_api:
         return None, 0, 0, (
@@ -170,24 +207,47 @@ def router_boucle_graphhopper(depart, duree_cible_min):
         )
 
     distance_m = int(max(20000, min(300000, duree_cible_min / 60 * 45000)))
-    params = {
-        "point": f"{depart[0]},{depart[1]}",
+    # Les classes OSM MOTORWAY, TRUNK et PRIMARY couvrent les autoroutes et
+    # l'essentiel des voies rapides / nationales. « 0 » les rend interdites,
+    # ce n'est pas une simple préférence d'itinéraire.
+    payload = {
+        "points": [[depart[1], depart[0]]],
         "profile": "car",
         "algorithm": "round_trip",
         "round_trip.distance": distance_m,
-        "round_trip.seed": int(abs(depart[0] * 1000 + depart[1] * 10000)),
-        "points_encoded": "false",
+        "round_trip.seed": int(abs(depart[0] * 1000 + depart[1] * 10000 + cap_initial)),
+        # GraphHopper utilise ce cap pour orienter le début du circuit.
+        "heading": cap_initial,
+        "heading_penalty": 600,
+        "points_encoded": False,
         "locale": "fr",
-        "key": cle_api,
+        "custom_model": {
+            "priority": [
+                {
+                    "if": "road_class == MOTORWAY || road_class == TRUNK || road_class == PRIMARY",
+                    "multiply_by": "0",
+                }
+            ]
+        },
     }
     try:
-        response = requests.get("https://graphhopper.com/api/1/route", params=params, timeout=45)
+        response = requests.post(
+            "https://graphhopper.com/api/1/route",
+            params={"key": cle_api},
+            json=payload,
+            timeout=45,
+        )
         data = response.json()
         if response.status_code == 200 and data.get("paths"):
             path = data["paths"][0]
             coords = [(point[1], point[0]) for point in path["points"]["coordinates"]]
             return coords, path["distance"] / 1000.0, path["time"] / 60000.0, None
         message = data.get("message", "réponse inattendue")
+        if message == "Connection between locations not found":
+            message = (
+                "aucune boucle n'est possible sans emprunter un axe interdit depuis ce départ. "
+                "Essayez un départ placé sur une petite route."
+            )
         return None, 0, 0, f"GraphHopper : {message}"
     except (requests.RequestException, ValueError, KeyError) as exc:
         return None, 0, 0, f"Connexion à GraphHopper impossible : {exc}"
@@ -623,7 +683,7 @@ with st.sidebar:
         help="Le mode Trail affiche en vert les chemins et pistes non goudronnées."
     )
 
-    ville_depart = st.text_input("📍 Ville de départ (Point A)", "Montbeton")
+    ville_depart = saisir_ville_avec_suggestions("📍 Ville de départ (Point A)", "Montbeton", "depart")
     est_boucle = "boucle" in type_itineraire
     if est_boucle:
         duree_boucle_h = st.slider(
@@ -634,13 +694,21 @@ with st.sidebar:
             step=0.5,
             help="Le moteur spécialisé génère un circuit au plus près de cette durée.",
         )
+        direction_boucle = st.radio(
+            "🧭 Direction principale de la boucle",
+            options=["⬆️ Nord", "➡️ Est", "⬇️ Sud", "⬅️ Ouest"],
+            horizontal=True,
+        )
         st.caption("Circuit automatique, départ et arrivée identiques.")
         etape_intermediaire = ""
         ville_arrivee = ville_depart
     else:
         duree_boucle_h = None
-        etape_intermediaire = st.text_input("📌 Étape intermédiaire (Optionnel)", "Auch")
-        ville_arrivee = st.text_input("🏁 Ville d'arrivée (Point B)", "Lourdes")
+        direction_boucle = None
+        etape_intermediaire = saisir_ville_avec_suggestions(
+            "📌 Étape intermédiaire (Optionnel)", "Auch", "etape"
+        )
+        ville_arrivee = saisir_ville_avec_suggestions("🏁 Ville d'arrivée (Point B)", "Lourdes", "arrivee")
 
     heure_depart = st.time_input("🕒 Heure de départ", datetime.time(9, 0), step=900)
     autonomie_km = st.slider("⛽ Autonomie réservoir / Plein (km)", 150, 350, 200, step=10)
@@ -678,8 +746,9 @@ if btn_generer:
         else:
             is_trail = "Trail" in categorie
             if est_boucle:
+                caps_direction = {"⬆️ Nord": 0, "➡️ Est": 90, "⬇️ Sud": 180, "⬅️ Ouest": 270}
                 coords_trace, dist_reelle, duree_min, erreur_routage = router_boucle_graphhopper(
-                    coords_dep, int(duree_boucle_h * 60)
+                    coords_dep, int(duree_boucle_h * 60), caps_direction[direction_boucle]
                 )
             else:
                 waypoints = [coords_dep]
@@ -729,6 +798,7 @@ if btn_generer:
                     "is_trail": is_trail,
                     "est_boucle": est_boucle,
                     "duree_boucle_cible": duree_boucle_h,
+                    "direction_boucle": direction_boucle,
                     "pistes": pistes_overlay,
                     "coords_etape": coords_etape,
                     "d_pos": d_pos,
@@ -755,7 +825,10 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         f"📋 Résumé — {libelle_type} ({'Mode Trail' if res['is_trail'] else 'Mode Routière'})"
     )
     if res.get("est_boucle"):
-        st.caption(f"Objectif : environ {res['duree_boucle_cible']:.1f} h de roulage.")
+        st.caption(
+            f"Objectif : environ {res['duree_boucle_cible']:.1f} h de roulage, "
+            f"en partant vers {res['direction_boucle']}."
+        )
 
     # Affichage sur 5 colonnes incluant désormais le % de virages
     c1, c2, c3, c4, c5 = st.columns(5)
