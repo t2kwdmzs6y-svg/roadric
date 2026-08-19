@@ -17,7 +17,55 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+    @media (max-width: 768px) {
+        .block-container { padding: 1rem 0.75rem 3rem; }
+        .st-key-resume_metrics [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.5rem !important;
+        }
+        .st-key-resume_metrics [data-testid="stColumn"] {
+            flex: 1 1 calc(50% - 0.5rem) !important;
+            min-width: calc(50% - 0.5rem) !important;
+        }
+        .st-key-resume_metrics [data-testid="stMetric"] { padding: 0.55rem; }
+        .st-key-resume_metrics [data-testid="stMetricLabel"] { font-size: 0.78rem; }
+        .st-key-resume_metrics [data-testid="stMetricValue"] { font-size: 1.2rem; }
+        .stButton > button, [data-testid="stLinkButton"] > a { min-height: 46px; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🏍️ ROADRIC — Générateur de Road-Trip Moto")
+
+
+@st.dialog("🏍️ Bienvenue sur ROADRIC")
+def afficher_bienvenue():
+    st.write("Préparez votre prochaine balade moto en quelques instants.")
+    st.caption("Développé par Eric, un passionné de moto.")
+    st.markdown(
+        "- **Aller simple** : choisissez un départ, une arrivée et, si besoin, une étape.\n"
+        "- **Balade en boucle** : indiquez une durée et une direction.\n"
+        "- Les autoroutes sont évitées pour privilégier les routes de balade."
+    )
+    st.markdown("---")
+    st.caption("🏍️ Club moto à découvrir")
+    st.link_button(
+        "Pleins Phares 82",
+        "https://www.facebook.com/groups/656601229660372/",
+        use_container_width=True,
+    )
+    if st.button("🏁 Commencer", use_container_width=True):
+        st.session_state["bienvenue_vue"] = True
+        st.rerun()
+
+
+if not st.session_state.get("bienvenue_vue", False):
+    afficher_bienvenue()
 
 # -----------------------------------------------------------------------------
 # FONCTIONS DE GÉOCODAGE ET CALCULS
@@ -831,12 +879,13 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         )
 
     # Affichage sur 5 colonnes incluant désormais le % de virages
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("📏 Distance Totale", f"{res['dist_km']} km")
-    c2.metric("⏱️ Temps Roulage", res["duree_roulage"])
-    c3.metric("🏁 Arrivée Estimée", res["heure_arr"], help="Inclut les pauses café + repas")
-    c4.metric("🔄 Courbes & Virages", f"{res['pct_virages']}%")
-    c5.metric("🏔️ Dénivelé (+ / -)", f"+{res['d_pos']}m / -{res['d_neg']}m")
+    with st.container(key="resume_metrics"):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("📏 Distance Totale", f"{res['dist_km']} km")
+        c2.metric("⏱️ Temps Roulage", res["duree_roulage"])
+        c3.metric("🏁 Arrivée Estimée", res["heure_arr"], help="Inclut les pauses café + repas")
+        c4.metric("🔄 Courbes & Virages", f"{res['pct_virages']}%")
+        c5.metric("🏔️ Dénivelé (+ / -)", f"+{res['d_pos']}m / -{res['d_neg']}m")
 
     st.markdown("---")
 
@@ -905,7 +954,7 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         folium.Marker(res["coords_etape"], popup=f"Étape : {res['info_etape'].get('label', '')}", icon=folium.Icon(color="orange", icon="info-sign")).add_to(m)
     folium.Marker(res["coords"][-1], popup=f"Arrivée : {res['info_arr'].get('label', '')}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
 
-    st_folium(m, width="100%", height=550, returned_objects=[])
+    st_folium(m, width="100%", height=440, returned_objects=[])
 
     if res["elevations"]:
         st.subheader("📈 Profil d'Élévation")
@@ -928,6 +977,26 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
 
 else:
     st.info("👈 Saisissez vos villes dans la barre latérale et cliquez sur **🚀 Calculer l'Itinéraire**.")
+
+
+if st.session_state.get("trajet_resultat"):
+    with st.sidebar:
+        resultat_gps = st.session_state["trajet_resultat"]
+        # Sur une boucle, une appli de navigation classique ne peut pas recevoir
+        # tout le circuit : on lui propose le premier quart du parcours.
+        index_guidage = (
+            max(1, len(resultat_gps["coords"]) // 4)
+            if resultat_gps.get("est_boucle")
+            else -1
+        )
+        lat_guidage, lon_guidage = resultat_gps["coords"][index_guidage]
+        st.link_button(
+            "🧭 Essayer d'ouvrir l'application GPS",
+            f"geo:{lat_guidage:.6f},{lon_guidage:.6f}?q={lat_guidage:.6f},{lon_guidage:.6f}",
+            help="Sur téléphone, ce lien ouvre l'application de cartes/navigation associée à l'appareil.",
+            use_container_width=True,
+        )
+        st.caption("Pour suivre tout le tracé, utilisez toujours l'export GPX.")
 
 
 # Le bloc est créé après le calcul afin que le bouton apparaisse immédiatement
