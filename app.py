@@ -1,4 +1,14 @@
+# =============================================================================
+# ROADRIC — Version 2026.08.20
+# Principales évolutions : boucles orientées avec dénivelé et routes à éviter,
+# stations et points d'intérêt, export GPX, roadbook détaillé (virages,
+# pauses, points photo) téléchargeable, choix d'adresses précises au départ
+# et à l'arrivée, interface mobile et fond Adventure.
+# =============================================================================
+
 import datetime
+import base64
+from html import escape
 import math
 import os
 from pathlib import Path
@@ -16,6 +26,36 @@ st.set_page_config(
     page_icon="🏍️",
     layout="wide",
 )
+
+
+def appliquer_fond_roadric():
+    """Ajoute une image de fond discrète sans gêner la lecture de l'application."""
+    try:
+        image_fond = base64.b64encode(
+            Path(__file__).with_name("roadric-fond.jpg").read_bytes()
+        ).decode("ascii")
+    except OSError:
+        return
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"] {{
+            background-image:
+                linear-gradient(rgba(248, 251, 255, 0.72), rgba(248, 251, 255, 0.72)),
+                url("data:image/jpeg;base64,{image_fond}");
+            background-attachment: fixed;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-size: cover;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+appliquer_fond_roadric()
 
 st.markdown(
     """
@@ -46,6 +86,7 @@ st.title("🏍️ ROADRIC — Générateur de Road-Trip Moto")
 @st.dialog("🏍️ Bienvenue sur ROADRIC")
 def afficher_bienvenue():
     st.write("Préparez votre prochaine balade moto en quelques instants.")
+    st.write("ROADRIC recherche un maximum de points de vue, d'altitude et de virages pour rendre chaque sortie mémorable.")
     st.caption("Développé par Eric, un passionné de moto.")
     st.markdown(
         "- **Aller simple** : choisissez un départ, une arrivée et, si besoin, une étape.\n"
@@ -59,6 +100,7 @@ def afficher_bienvenue():
         "https://www.facebook.com/groups/656601229660372/",
         use_container_width=True,
     )
+    st.caption("💾 Exportez votre itinéraire en GPX. Pour les pros, éditez votre roadbook.")
     if st.button("🏁 Commencer", use_container_width=True):
         st.session_state["bienvenue_vue"] = True
         st.rerun()
@@ -126,6 +168,43 @@ def geocode_ville_details(nom_ville):
         details = villes[0]
         return (details["lat"], details["lon"]), details
     return None, {}
+
+
+@st.cache_data(ttl=86400)
+def rechercher_adresses(rue, ville):
+    if len(rue.strip()) < 3:
+        return []
+    try:
+        data = requests.get("https://api-adresse.data.gouv.fr/search/", params={"q": f"{rue}, {ville}", "limit": 6}, timeout=4).json()
+        return [{"label": item["properties"].get("label", "Adresse"), "lat": item["geometry"]["coordinates"][1], "lon": item["geometry"]["coordinates"][0]} for item in data.get("features", [])]
+    except (requests.RequestException, ValueError, KeyError):
+        return []
+
+
+@st.dialog("📍 Choisir le point de départ")
+def choisir_depart_precis(ville):
+    rue = st.text_input("Rue ou adresse", placeholder="Ex. avenue de Toulouse")
+    adresses = rechercher_adresses(rue, ville)
+    if adresses:
+        labels = [adresse["label"] for adresse in adresses]
+        choix = st.selectbox("Adresse proposée", labels)
+        if st.button("Utiliser cette adresse", use_container_width=True):
+            adresse = adresses[labels.index(choix)]
+            st.session_state["depart_precis"] = {**adresse, "ville_source": ville}
+            st.rerun()
+
+
+@st.dialog("🏁 Choisir le point d'arrivée")
+def choisir_arrivee_precise(ville):
+    rue = st.text_input("Rue ou adresse d'arrivée", placeholder="Ex. place de la Mairie")
+    adresses = rechercher_adresses(rue, ville)
+    if adresses:
+        labels = [adresse["label"] for adresse in adresses]
+        choix = st.selectbox("Adresse proposée", labels)
+        if st.button("Utiliser cette adresse", use_container_width=True):
+            adresse = adresses[labels.index(choix)]
+            st.session_state["arrivee_precise"] = {**adresse, "ville_source": ville}
+            st.rerun()
 
 
 def proposer_villes(saisie):
@@ -252,13 +331,13 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         return None, 0, 0, (
             "Le mode boucle nécessite la clé administrateur GraphHopper. "
             "Ajoutez GRAPHHOPPER_API_KEY dans le fichier .env."
-        )
+        ), []
 
     distance_m = int(max(20000, min(300000, duree_cible_min / 60 * 45000)))
     # Les classes OSM MOTORWAY, TRUNK et PRIMARY couvrent les autoroutes et
     # l'essentiel des voies rapides / nationales. « 0 » les rend interdites,
     # ce n'est pas une simple préférence d'itinéraire.
-    payload = {
+    payload_base = {
         "points": [[depart[1], depart[0]]],
         "profile": "car",
         "algorithm": "round_trip",
@@ -268,6 +347,7 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         "heading": cap_initial,
         "heading_penalty": 600,
         "points_encoded": False,
+        "elevation": True,
         "locale": "fr",
         "custom_model": {
             "priority": [
@@ -279,26 +359,31 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         },
     }
     try:
-        response = requests.post(
-            "https://graphhopper.com/api/1/route",
-            params={"key": cle_api},
-            json=payload,
-            timeout=45,
-        )
-        data = response.json()
-        if response.status_code == 200 and data.get("paths"):
-            path = data["paths"][0]
-            coords = [(point[1], point[0]) for point in path["points"]["coordinates"]]
-            return coords, path["distance"] / 1000.0, path["time"] / 60000.0, None
-        message = data.get("message", "réponse inattendue")
+        candidates, erreurs = [], []
+        # Trois graines différentes : on garde le circuit qui offre le plus de montée.
+        for variation in range(3):
+            payload = payload_base.copy()
+            payload["round_trip.seed"] += variation * 7919
+            response = requests.post("https://graphhopper.com/api/1/route", params={"key": cle_api}, json=payload, timeout=45)
+            data = response.json()
+            if response.status_code == 200 and data.get("paths"):
+                path = data["paths"][0]
+                coords = [(point[1], point[0]) for point in path["points"]["coordinates"]]
+                candidates.append((path.get("ascend", 0), coords, path["distance"] / 1000.0, path["time"] / 60000.0, path.get("instructions", [])))
+            else:
+                erreurs.append(data.get("message", "réponse inattendue"))
+        if candidates:
+            _, coords, distance, duree, instructions = max(candidates, key=lambda candidat: candidat[0])
+            return coords, distance, duree, None, instructions
+        message = erreurs[0] if erreurs else "réponse inattendue"
         if message == "Connection between locations not found":
             message = (
                 "aucune boucle n'est possible sans emprunter un axe interdit depuis ce départ. "
                 "Essayez un départ placé sur une petite route."
             )
-        return None, 0, 0, f"GraphHopper : {message}"
+        return None, 0, 0, f"GraphHopper : {message}", []
     except (requests.RequestException, ValueError, KeyError) as exc:
-        return None, 0, 0, f"Connexion à GraphHopper impossible : {exc}"
+        return None, 0, 0, f"Connexion à GraphHopper impossible : {exc}", []
 
 
 def point_a_distance(lat, lon, distance_km, cap_deg):
@@ -442,6 +527,56 @@ def creer_gpx(coords, nom="Roadric - Road-trip moto"):
         ET.SubElement(segment, "trkpt", {"lat": str(lat), "lon": str(lon)})
 
     return ET.tostring(gpx, encoding="utf-8", xml_declaration=True)
+
+
+def creer_roadbook(resultat):
+    """Prépare les repères de balade, classés par kilomètre."""
+    depart = resultat["info_dep"]
+    point_depart = depart.get("label", "Point de départ")
+    if "lat" in depart and "lon" in depart:
+        point_depart += f" — GPS : {depart['lat']:.5f}, {depart['lon']:.5f}"
+    etapes = [(0, "🏁 Départ", point_depart)]
+    cumul = 0.0
+    for instruction in resultat.get("instructions", []):
+        cumul = instruction.get("km", cumul + instruction.get("distance", 0) / 1000)
+        if instruction.get("sign", 0) != 0:
+            etapes.append((cumul, "🧭 Direction", instruction.get("text", "Suivre la route")))
+    for pause in resultat.get("etapes_pauses", []):
+        etapes.append((pause["km"], "☕ Pause", f"{pause['type']} — {pause['lieu']}"))
+    for poi in resultat.get("points_interet", []):
+        etapes.append((poi["km"], "📸 À découvrir", poi["nom"]))
+    for station in resultat.get("stations_recommandees", []):
+        etapes.append((station["km"], "⛽ Carburant", station["nom"]))
+    arrivee = "Retour au départ" if resultat.get("est_boucle") else resultat["info_arr"].get("label", "Arrivée")
+    etapes.append((resultat["dist_km"], "🏁 Arrivée", arrivee))
+    return sorted(etapes, key=lambda etape: etape[0])
+
+
+def creer_instructions_traces(coords):
+    """Déduit les virages majeurs du tracé BRouter pour les allers simples."""
+    instructions, cumul, dernier_km = [], 0.0, -1.0
+    for i in range(1, len(coords) - 1):
+        cumul += haversine_distance(coords[i - 1], coords[i]) / 1000
+        cap1 = math.degrees(math.atan2(coords[i][1] - coords[i - 1][1], coords[i][0] - coords[i - 1][0]))
+        cap2 = math.degrees(math.atan2(coords[i + 1][1] - coords[i][1], coords[i + 1][0] - coords[i][0]))
+        angle = (cap2 - cap1 + 180) % 360 - 180
+        if abs(angle) >= 55 and cumul - dernier_km >= 0.5:
+            sens = "à droite" if angle > 0 else "à gauche"
+            instructions.append({"km": round(cumul, 1), "sign": 1, "text": f"Virage important {sens}"})
+            dernier_km = cumul
+    return instructions
+
+
+def creer_roadbook_html(resultat):
+    lignes = "".join(f"<tr><td>{km:.1f} km</td><td>{escape(type_etape)}</td><td>{escape(detail)}</td></tr>" for km, type_etape, detail in creer_roadbook(resultat))
+    return f"<html><meta charset='utf-8'><style>body{{font-family:Arial;margin:28px}}td{{padding:10px;border-bottom:1px solid #ddd}}</style><h1>🏍️ ROADRIC — Roadbook</h1><table>{lignes}</table></html>"
+
+
+@st.dialog("📜 Roadbook de la balade")
+def afficher_roadbook(resultat):
+    st.download_button("⬇️ Télécharger le roadbook", creer_roadbook_html(resultat), "roadric-roadbook.html", "text/html", use_container_width=True)
+    for km, type_etape, detail in creer_roadbook(resultat):
+        st.info(f"**km {km:.1f} — {type_etape}**\n{detail}")
 
 
 def calculer_étapes_pauses_et_plein(coords, dist_totale_km, duree_min_totale, heure_dep, intervalle_plein_km=200):
@@ -681,6 +816,34 @@ def positionner_stations_sur_trajet(stations, coords):
     return resultat
 
 
+def chercher_points_interet(coords):
+    """Trouve quelques panoramas, sites et patrimoines proches de la boucle."""
+    if not coords:
+        return []
+    echantillons = [coords[int(i * (len(coords) - 1) / 4)] for i in range(5)]
+    zones = "".join(
+        f'nwr["tourism"~"viewpoint|attraction|museum"](around:6000,{lat},{lon});'
+        f'nwr["historic"](around:6000,{lat},{lon});nwr["natural"~"peak|waterfall"](around:6000,{lat},{lon});'
+        for lat, lon in echantillons
+    )
+    query = f"[out:json][timeout:20];({zones});out tags center;"
+    for url in ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"):
+        try:
+            data = requests.get(url, params={"data": query}, timeout=25).json()
+            trouves, vus = [], set()
+            for el in data.get("elements", []):
+                identifiant = (el.get("type"), el.get("id"))
+                centre, tags = el.get("center", el), el.get("tags", {})
+                if identifiant in vus or not tags.get("name") or "lat" not in centre:
+                    continue
+                vus.add(identifiant)
+                trouves.append({"nom": tags["name"], "type": tags.get("tourism") or tags.get("historic") or "Point d'intérêt", "lat": centre["lat"], "lon": centre["lon"]})
+            return positionner_stations_sur_trajet(trouves, coords)[:8]
+        except (requests.RequestException, ValueError):
+            pass
+    return []
+
+
 def recommander_stations(stations, distance_totale_km, autonomie_km):
     """Choisit des vraies stations atteignables avant chaque plein."""
     stations = sorted(stations, key=lambda station: station["km"])
@@ -732,10 +895,15 @@ with st.sidebar:
     )
 
     ville_depart = saisir_ville_avec_suggestions("📍 Ville de départ (Point A)", "Montbeton", "depart")
+    if st.button("📍 Choisir une rue précise", use_container_width=True):
+        choisir_depart_precis(ville_depart)
+    depart_precis = st.session_state.get("depart_precis")
+    if depart_precis and depart_precis.get("ville_source") == ville_depart:
+        st.caption(f"Départ retenu : {depart_precis['label']}")
     est_boucle = "boucle" in type_itineraire
     if est_boucle:
         duree_boucle_h = st.slider(
-            "⏱️ Durée de roulage souhaitée",
+            "⏱️ Durée de roulage souhaitée (en heures)",
             min_value=1.0,
             max_value=8.0,
             value=3.0,
@@ -757,11 +925,18 @@ with st.sidebar:
             "📌 Étape intermédiaire (Optionnel)", "Auch", "etape"
         )
         ville_arrivee = saisir_ville_avec_suggestions("🏁 Ville d'arrivée (Point B)", "Lourdes", "arrivee")
+        if st.button("🏁 Choisir une rue d'arrivée", use_container_width=True):
+            choisir_arrivee_precise(ville_arrivee)
+        arrivee_precise = st.session_state.get("arrivee_precise")
+        if arrivee_precise and arrivee_precise.get("ville_source") == ville_arrivee:
+            st.caption(f"Arrivée retenue : {arrivee_precise['label']}")
 
     heure_depart = st.time_input("🕒 Heure de départ", datetime.time(9, 0), step=900)
     autonomie_km = st.slider("⛽ Autonomie réservoir / Plein (km)", 150, 350, 200, step=10)
 
     btn_generer = st.button("🚀 Calculer l'Itinéraire", use_container_width=True)
+    zone_export_gpx = st.empty()
+    zone_roadbook = st.empty()
 
 
 # -----------------------------------------------------------------------------
@@ -769,7 +944,12 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 if btn_generer:
     with st.spinner("Calcul du tracé, calcul du % de virages et des pauses..."):
-        coords_dep, info_dep = geocode_ville_details(ville_depart)
+        depart_precis = st.session_state.get("depart_precis")
+        if depart_precis and depart_precis.get("ville_source") == ville_depart:
+            coords_dep = (depart_precis["lat"], depart_precis["lon"])
+            info_dep = depart_precis
+        else:
+            coords_dep, info_dep = geocode_ville_details(ville_depart)
         if est_boucle:
             coords_etape, info_etape = None, {}
             coords_arr, info_arr = coords_dep, info_dep
@@ -779,7 +959,12 @@ if btn_generer:
                 if etape_intermediaire.strip()
                 else (None, {})
             )
-            coords_arr, info_arr = geocode_ville_details(ville_arrivee)
+            arrivee_precise = st.session_state.get("arrivee_precise")
+            if arrivee_precise and arrivee_precise.get("ville_source") == ville_arrivee:
+                coords_arr = (arrivee_precise["lat"], arrivee_precise["lon"])
+                info_arr = arrivee_precise
+            else:
+                coords_arr, info_arr = geocode_ville_details(ville_arrivee)
 
         villes_non_trouvees = []
         if not coords_dep:
@@ -795,7 +980,7 @@ if btn_generer:
             is_trail = "Trail" in categorie
             if est_boucle:
                 caps_direction = {"⬆️ Nord": 0, "➡️ Est": 90, "⬇️ Sud": 180, "⬅️ Ouest": 270}
-                coords_trace, dist_reelle, duree_min, erreur_routage = router_boucle_graphhopper(
+                coords_trace, dist_reelle, duree_min, erreur_routage, instructions = router_boucle_graphhopper(
                     coords_dep, int(duree_boucle_h * 60), caps_direction[direction_boucle]
                 )
             else:
@@ -804,6 +989,7 @@ if btn_generer:
                     waypoints.append(coords_etape)
                 waypoints.append(coords_arr)
                 coords_trace, dist_reelle, duree_min, erreur_routage = router_sans_autoroute(waypoints)
+                instructions = creer_instructions_traces(coords_trace) if coords_trace else []
 
             if coords_trace:
                 d_pos, d_neg, pct_virages, elevations = obtenir_denivele_et_virages(coords_trace)
@@ -830,6 +1016,7 @@ if btn_generer:
                         )
                 else:
                     stations_recommandees, alertes_carburant = [], []
+                points_interet = chercher_points_interet(coords_trace) if est_boucle else []
 
                 dt_dep = datetime.datetime.combine(datetime.date.today(), heure_depart)
                 temps_total_min = duree_min + (len(etapes_pauses) * 20) + 45
@@ -855,9 +1042,12 @@ if btn_generer:
                     "etapes_pauses": etapes_pauses,
                     "stations_recommandees": stations_recommandees,
                     "alertes_carburant": alertes_carburant,
+                    "points_interet": points_interet,
+                    "instructions": instructions,
                     "elevations": elevations
                 }
                 st.session_state["gpx_exporte"] = False
+                st.session_state["roadbook_affiche"] = False
             else:
                 st.error(f"❌ {erreur_routage or 'Impossible de calculer le tracé. Réessayez.'}")
 
@@ -921,6 +1111,10 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
             st.success("✅ Trajet réalisable sur un seul plein !")
 
     st.markdown("---")
+    if res.get("points_interet"):
+        st.subheader("📸 À découvrir pendant la balade")
+        st.write(" • ".join(f"{poi['nom']} (km {poi['km']})" for poi in res["points_interet"]))
+
     st.subheader("🗺️ Carte du Parcours et Points d'Arrêt")
 
     m = folium.Map(location=res["coords"][0], zoom_start=9, tiles="OpenStreetMap")
@@ -948,6 +1142,8 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
             ),
             icon=folium.Icon(color="orange", icon="gas-pump", prefix="fa")
         ).add_to(m)
+    for poi in res.get("points_interet", []):
+        folium.Marker([poi["lat"], poi["lon"]], popup=f"{poi['nom']} — {poi['type']}", icon=folium.Icon(color="purple", icon="camera", prefix="fa")).add_to(m)
 
     folium.Marker(res["coords"][0], popup=f"Départ : {res['info_dep'].get('label', '')}", icon=folium.Icon(color="green", icon="play")).add_to(m)
     if res["coords_etape"]:
@@ -991,12 +1187,6 @@ if st.session_state.get("trajet_resultat"):
         )
         lat_guidage, lon_guidage = resultat_gps["coords"][index_guidage]
         st.link_button(
-            "🧭 Ouvrir dans Plans (iPhone)",
-            f"https://maps.apple.com/?daddr={lat_guidage:.6f},{lon_guidage:.6f}&dirflg=d",
-            help="Ouvre Plans d'Apple avec un itinéraire en voiture depuis votre position actuelle.",
-            use_container_width=True,
-        )
-        st.link_button(
             "🧭 Ouvrir dans Google Maps (Android)",
             f"https://www.google.com/maps/dir/?api=1&destination={lat_guidage:.6f},{lon_guidage:.6f}&travelmode=driving",
             help="Ouvre Google Maps si l'application est installée, sinon le navigateur.",
@@ -1008,7 +1198,7 @@ if st.session_state.get("trajet_resultat"):
 # Le bloc est créé après le calcul afin que le bouton apparaisse immédiatement
 # lors de l'affichage du résultat, sous le bouton de calcul de la barre latérale.
 if st.session_state.get("trajet_resultat") and not st.session_state.get("gpx_exporte", False):
-    with st.sidebar:
+    with zone_export_gpx:
         export_effectue = st.download_button(
             "⬇️ Exporter l'itinéraire en GPX",
             data=creer_gpx(st.session_state["trajet_resultat"]["coords"]),
@@ -1019,3 +1209,8 @@ if st.session_state.get("trajet_resultat") and not st.session_state.get("gpx_exp
         if export_effectue:
             st.session_state["gpx_exporte"] = True
             st.rerun()
+
+if st.session_state.get("trajet_resultat"):
+    with zone_roadbook:
+        if st.button("📜 Générer le roadbook", use_container_width=True):
+            afficher_roadbook(st.session_state["trajet_resultat"])
