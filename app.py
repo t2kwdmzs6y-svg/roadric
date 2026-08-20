@@ -921,8 +921,11 @@ with st.sidebar:
     else:
         duree_boucle_h = None
         direction_boucle = None
-        etape_intermediaire = saisir_ville_avec_suggestions(
-            "📌 Étape intermédiaire (Optionnel)", "Auch", "etape"
+        ajouter_etape = st.checkbox("➕ Ajouter une étape intermédiaire")
+        etape_intermediaire = (
+            saisir_ville_avec_suggestions("📌 Étape intermédiaire", "Auch", "etape")
+            if ajouter_etape
+            else ""
         )
         ville_arrivee = saisir_ville_avec_suggestions("🏁 Ville d'arrivée (Point B)", "Lourdes", "arrivee")
         if st.button("🏁 Choisir une rue d'arrivée", use_container_width=True):
@@ -943,6 +946,9 @@ with st.sidebar:
 # CALCUL DE L'ITINÉRAIRE
 # -----------------------------------------------------------------------------
 if btn_generer:
+    ville_depart = ville_depart or ""
+    ville_arrivee = ville_arrivee or ""
+    etape_intermediaire = etape_intermediaire or ""
     with st.spinner("Calcul du tracé, calcul du % de virages et des pauses..."):
         depart_precis = st.session_state.get("depart_precis")
         if depart_precis and depart_precis.get("ville_source") == ville_depart:
