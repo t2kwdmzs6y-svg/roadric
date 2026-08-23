@@ -1,9 +1,10 @@
 # =============================================================================
-# ROADRIC — Version 2026.08.20
-# Principales évolutions : boucles orientées avec dénivelé et routes à éviter,
-# stations et points d'intérêt, export GPX, roadbook détaillé (virages,
-# pauses, points photo) téléchargeable, choix d'adresses précises au départ
-# et à l'arrivée, interface mobile et fond Adventure.
+# ROADRIC — Version 2026.08.23
+# Principales évolutions : choix du trajet dès l'accueil, interface mobile
+# guidée, pauses programmées, recherche Trail sécurisée et optimisée,
+# secours GraphHopper compatible avec le forfait gratuit, statut SP98 des
+# stations, contenu SEO, partenaires et contact ROADRIC. Sont également
+# disponibles les boucles, points d'intérêt, exports GPX et roadbooks.
 # =============================================================================
 
 import datetime
