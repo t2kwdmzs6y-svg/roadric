@@ -23,7 +23,7 @@ from streamlit_searchbox import st_searchbox
 from xml.etree import ElementTree as ET
 
 st.set_page_config(
-    page_title="ROADRIC - Road-Trip Moto",
+    page_title="ROADRIC | Itinéraire moto, boucle et GPX",
     page_icon="🏍️",
     layout="wide",
 )
@@ -100,7 +100,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🏍️ ROADRIC — Générateur de Road-Trip Moto")
+st.title("🏍️ ROADRIC — Générateur d’itinéraires moto")
+st.markdown(
+    "Créez gratuitement votre **road-trip moto**, une **balade en boucle** "
+    "ou un trajet sur des **routes sinueuses**, puis exportez votre parcours "
+    "au format **GPX** avec pauses, stations-service et roadbook."
+)
 
 
 @st.dialog("🏍️ Bienvenue sur ROADRIC")
@@ -1406,6 +1411,23 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
 
 else:
     st.info("👈 Saisissez vos villes dans la barre latérale et cliquez sur **🚀 Calculer l'Itinéraire**.")
+
+
+st.markdown("---")
+st.subheader("Préparer une balade moto avec ROADRIC")
+st.markdown(
+    "ROADRIC aide les motards à créer un **itinéraire moto personnalisé** en "
+    "privilégiant les routes de balade et en évitant les autoroutes. Choisissez "
+    "un aller simple ou une boucle, votre heure de départ et l’autonomie de la "
+    "moto : l’application calcule le parcours, les pauses café et repas, les "
+    "stations-service et le dénivelé. Le mode Trail repère également les pistes "
+    "non goudronnées répertoriées dans OpenStreetMap."
+)
+st.caption(
+    "Exportez ensuite le tracé GPX pour votre GPS moto ou consultez le roadbook "
+    "détaillé avant le départ. Les conditions réelles et la signalisation sur "
+    "place restent toujours prioritaires."
+)
 
 
 if st.session_state.get("trajet_resultat"):
