@@ -82,6 +82,19 @@ st.markdown(
             background: var(--secondary-background-color);
             border-top: 1px solid rgba(128, 128, 128, 0.25);
         }
+        [data-testid="stSidebar"] button[kind="headerNoPadding"] > span,
+        button[data-testid="stExpandSidebarButton"] > span {
+            display: none !important;
+        }
+        [data-testid="stSidebar"] button[kind="headerNoPadding"]::before,
+        button[data-testid="stExpandSidebarButton"]::before {
+            content: "☰";
+            font-family: Arial, sans-serif;
+            font-size: 1.65rem;
+            font-weight: 700;
+            line-height: 1;
+            color: rgba(49, 51, 63, 0.75);
+        }
         .st-key-resume_metrics [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
             gap: 0.5rem !important;
@@ -122,12 +135,12 @@ def afficher_bienvenue():
     st.markdown("---")
     st.markdown("### 🤝 Les partenaires")
     st.caption(
-        "ROADRIC remercie ses partenaires qui contribuent à faire vivre "
-        "l'aventure moto."
+        "Vous souhaitez faire connaître votre club, votre association ou "
+        "votre activité dans l'univers moto ?"
     )
-    st.link_button(
-        "Découvrir Pleins Phares 82",
-        "https://www.facebook.com/groups/656601229660372/",
+    st.button(
+        "🤝 Espace partenaire disponible",
+        disabled=True,
         use_container_width=True,
     )
     st.caption("💾 Exportez votre itinéraire en GPX. Pour les pros, éditez votre roadbook.")
