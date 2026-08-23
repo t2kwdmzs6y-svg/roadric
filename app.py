@@ -116,7 +116,7 @@ def afficher_bienvenue():
     st.markdown(
         "- **Aller simple** : choisissez un départ, une arrivée et, si besoin, une étape.\n"
         "- **Balade en boucle** : indiquez une durée et une direction.\n"
-        "- Les autoroutes sont évitées pour privilégier les routes de balade."
+        "- Les autoroutes sont évitées autant que possible pour privilégier les routes de balade."
     )
     st.markdown("---")
     st.markdown("### 🤝 Les partenaires")
@@ -365,7 +365,7 @@ def router_sans_autoroute(waypoints, zones_a_eviter=None):
             # serveur public, notamment aux heures de forte utilisation.
             time.sleep(1.5 * (tentative + 1))
 
-    secours = router_graphhopper_sans_autoroute(waypoints, zones_a_eviter)
+    secours = router_graphhopper_secours(waypoints, zones_a_eviter)
     if secours[0]:
         return secours
 
@@ -395,8 +395,8 @@ def obtenir_cle_graphhopper():
         return ""
 
 
-def router_graphhopper_sans_autoroute(waypoints, zones_a_eviter=None):
-    """Calcule un aller simple avec GraphHopper lorsque BRouter ne répond pas."""
+def router_graphhopper_secours(waypoints, zones_a_eviter=None):
+    """Calcule un aller simple standard lorsque BRouter ne répond pas."""
     cle_api = obtenir_cle_graphhopper()
     if not cle_api:
         return None, 0, 0, "clé administrateur GraphHopper absente."
@@ -408,14 +408,6 @@ def router_graphhopper_sans_autoroute(waypoints, zones_a_eviter=None):
         "elevation": True,
         "locale": "fr",
         "instructions": False,
-        "custom_model": {
-            "priority": [
-                {
-                    "if": "road_class == MOTORWAY || road_class == TRUNK || road_class == PRIMARY",
-                    "multiply_by": "0",
-                }
-            ]
-        },
     }
 
     # GraphHopper ne reprend pas directement les cercles `nogos` de BRouter.
@@ -455,7 +447,7 @@ def router_graphhopper_sans_autoroute(waypoints, zones_a_eviter=None):
 
 
 def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
-    """Génère un circuit en excluant les autoroutes et grands axes."""
+    """Génère plusieurs circuits et conserve celui qui offre le plus de montée."""
     cle_api = obtenir_cle_graphhopper()
     if not cle_api:
         return None, 0, 0, (
@@ -464,9 +456,6 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         ), []
 
     distance_m = int(max(20000, min(300000, duree_cible_min / 60 * 45000)))
-    # Les classes OSM MOTORWAY, TRUNK et PRIMARY couvrent les autoroutes et
-    # l'essentiel des voies rapides / nationales. « 0 » les rend interdites,
-    # ce n'est pas une simple préférence d'itinéraire.
     payload_base = {
         "points": [[depart[1], depart[0]]],
         "profile": "car",
@@ -479,14 +468,6 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         "points_encoded": False,
         "elevation": True,
         "locale": "fr",
-        "custom_model": {
-            "priority": [
-                {
-                    "if": "road_class == MOTORWAY || road_class == TRUNK || road_class == PRIMARY",
-                    "multiply_by": "0",
-                }
-            ]
-        },
     }
     try:
         candidates, erreurs = [], []
@@ -494,7 +475,12 @@ def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
         for variation in range(3):
             payload = payload_base.copy()
             payload["round_trip.seed"] += variation * 7919
-            response = requests.post("https://graphhopper.com/api/1/route", params={"key": cle_api}, json=payload, timeout=45)
+            response = requests.post(
+                "https://graphhopper.com/api/1/route",
+                params={"key": cle_api},
+                json=payload,
+                timeout=45,
+            )
             data = response.json()
             if response.status_code == 200 and data.get("paths"):
                 path = data["paths"][0]
