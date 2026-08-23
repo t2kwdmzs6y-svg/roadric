@@ -119,7 +119,7 @@ def afficher_bienvenue():
         "- Les autoroutes sont évitées pour privilégier les routes de balade."
     )
     st.markdown("---")
-    st.markdown("### 🤝 Nos partenaires")
+    st.markdown("### 🤝 Les partenaires")
     st.caption(
         "ROADRIC remercie ses partenaires qui contribuent à faire vivre "
         "l'aventure moto."
@@ -1427,6 +1427,18 @@ st.caption(
     "Exportez ensuite le tracé GPX pour votre GPS moto ou consultez le roadbook "
     "détaillé avant le départ. Les conditions réelles et la signalisation sur "
     "place restent toujours prioritaires."
+)
+
+st.subheader("📬 Contacter ROADRIC")
+st.write(
+    "Une question, une suggestion, un problème technique ou une proposition "
+    "de partenariat ? Écrivez-moi directement."
+)
+st.link_button(
+    "📧 Envoyer un e-mail à ROADRIC",
+    "mailto:contact.roadric@gmail.com"
+    "?subject=Contact%20depuis%20ROADRIC"
+    "&body=Bonjour%2C%0A%0AJe%20vous%20contacte%20au%20sujet%20de%20ROADRIC.%0A%0A",
 )
 
 
