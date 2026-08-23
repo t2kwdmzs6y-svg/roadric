@@ -676,7 +676,14 @@ def creer_roadbook(resultat):
     for poi in resultat.get("points_interet", []):
         etapes.append((poi["km"], "📸 À découvrir", poi["nom"]))
     for station in resultat.get("stations_recommandees", []):
-        etapes.append((station["km"], "⛽ Carburant", station["nom"]))
+        statut_sp98 = {
+            "confirme": "SP98 confirmé",
+            "non_renseigne": "SP98 non renseigné",
+            "indisponible": "SP98 indisponible",
+        }.get(station.get("statut_sp98"), "SP98 non renseigné")
+        etapes.append(
+            (station["km"], "⛽ Carburant", f"{station['nom']} — {statut_sp98}")
+        )
     arrivee = "Retour au départ" if resultat.get("est_boucle") else resultat["info_arr"].get("label", "Arrivée")
     etapes.append((resultat["dist_km"], "🏁 Arrivée", arrivee))
     return sorted(etapes, key=lambda etape: etape[0])
@@ -968,6 +975,13 @@ def chercher_stations_essence_overpass(coords, rayon_m=8000, intervalle_km=12):
             continue
 
         tags = element.get("tags", {})
+        valeur_sp98 = tags.get("fuel:octane_98", "").strip().lower()
+        if valeur_sp98 == "yes":
+            statut_sp98 = "confirme"
+        elif valeur_sp98 == "no":
+            statut_sp98 = "indisponible"
+        else:
+            statut_sp98 = "non_renseigne"
         stations.append({
             "nom": tags.get("name") or tags.get("brand") or "Station-service",
             "marque": tags.get("brand", ""),
@@ -978,6 +992,7 @@ def chercher_stations_essence_overpass(coords, rayon_m=8000, intervalle_km=12):
                 tags.get("addr:city"),
             ])),
             "horaires": tags.get("opening_hours", "Horaires non renseignés"),
+            "statut_sp98": statut_sp98,
             "lat": lat,
             "lon": lon,
         })
@@ -1037,7 +1052,7 @@ def chercher_points_interet(coords):
 
 
 def recommander_stations(stations, distance_totale_km, autonomie_km):
-    """Choisit des vraies stations atteignables avant chaque plein."""
+    """Choisit des stations atteignables en privilégiant le SP98 confirmé."""
     stations = sorted(stations, key=lambda station: station["km"])
     recommandations, alertes = [], []
     dernier_plein = 0.0
@@ -1046,7 +1061,10 @@ def recommander_stations(stations, distance_totale_km, autonomie_km):
         limite = dernier_plein + autonomie_km
         accessibles = [
             station for station in stations
-            if dernier_plein + 5 < station["km"] <= limite
+            if (
+                dernier_plein + 5 < station["km"] <= limite
+                and station.get("statut_sp98") != "indisponible"
+            )
         ]
         if not accessibles:
             alertes.append(
@@ -1063,7 +1081,13 @@ def recommander_stations(stations, distance_totale_km, autonomie_km):
                 distance_totale_km - autonomie_km,
             ),
         )
-        station = min(accessibles, key=lambda item: abs(item["km"] - objectif))
+        stations_sp98 = [
+            station
+            for station in accessibles
+            if station.get("statut_sp98") == "confirme"
+        ]
+        candidates = stations_sp98 or accessibles
+        station = min(candidates, key=lambda item: abs(item["km"] - objectif))
         recommandations.append(station)
         dernier_plein = station["km"]
 
@@ -1330,12 +1354,22 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         if res["stations_recommandees"]:
             for station in res["stations_recommandees"]:
                 marque = f" — {station['marque']}" if station["marque"] else ""
+                statuts_sp98 = {
+                    "confirme": "✅ SP98 confirmé",
+                    "indisponible": "❌ SP98 indiqué comme indisponible",
+                    "non_renseigne": "❔ SP98 non renseigné dans OpenStreetMap",
+                }
+                statut_sp98 = statuts_sp98.get(
+                    station.get("statut_sp98"),
+                    "❔ SP98 non renseigné dans OpenStreetMap",
+                )
                 detour = (
                     f" (à {station['ecart_route_km']} km du tracé)"
                     if station["ecart_route_km"] else ""
                 )
                 st.warning(
                     f"**{station['nom']}{marque}** — km **{station['km']}**{detour}\n"
+                    f"⛽ {statut_sp98}\n"
                     f"📍 {station['adresse'] or 'Adresse non renseignée'}\n"
                     f"🕒 {station['horaires']}"
                 )
@@ -1371,10 +1405,19 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         ).add_to(m)
 
     for st_rec in res["stations_recommandees"]:
+        statuts_sp98_carte = {
+            "confirme": "SP98 confirmé",
+            "indisponible": "SP98 indisponible",
+            "non_renseigne": "SP98 non renseigné",
+        }
+        statut_sp98_carte = statuts_sp98_carte.get(
+            st_rec.get("statut_sp98"), "SP98 non renseigné"
+        )
         folium.Marker(
             [st_rec["lat"], st_rec["lon"]],
             popup=(
                 f"{st_rec['nom']} — km {st_rec['km']}<br>"
+                f"{statut_sp98_carte}<br>"
                 f"{st_rec['adresse'] or 'Adresse non renseignée'}<br>"
                 f"{st_rec['horaires']}"
             ),
