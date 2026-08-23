@@ -11,6 +11,7 @@ import base64
 from html import escape
 import math
 import os
+import time
 from pathlib import Path
 import altair as alt
 import folium
@@ -62,6 +63,24 @@ st.markdown(
     <style>
     @media (max-width: 768px) {
         .block-container { padding: 1rem 0.75rem 3rem; }
+        .mobile-scroll-hint {
+            display: block !important;
+            margin: 0.25rem 0 0.75rem;
+            padding: 0.65rem 0.75rem;
+            border-radius: 0.5rem;
+            background: #fff3cd;
+            color: #664d03;
+            font-weight: 600;
+            text-align: center;
+        }
+        [data-testid="stSidebar"] .st-key-calcul_mobile_sticky {
+            position: sticky;
+            bottom: 0;
+            z-index: 20;
+            padding: 0.65rem 0 0.35rem;
+            background: var(--secondary-background-color);
+            border-top: 1px solid rgba(128, 128, 128, 0.25);
+        }
         .st-key-resume_metrics [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
             gap: 0.5rem !important;
@@ -75,6 +94,7 @@ st.markdown(
         .st-key-resume_metrics [data-testid="stMetricValue"] { font-size: 1.2rem; }
         .stButton > button, [data-testid="stLinkButton"] > a { min-height: 46px; }
     }
+    .mobile-scroll-hint { display: none; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -94,16 +114,37 @@ def afficher_bienvenue():
         "- Les autoroutes sont évitées pour privilégier les routes de balade."
     )
     st.markdown("---")
-    st.caption("🏍️ Club moto à découvrir")
+    st.markdown("### 🤝 Nos partenaires")
+    st.caption(
+        "ROADRIC remercie ses partenaires qui contribuent à faire vivre "
+        "l'aventure moto."
+    )
     st.link_button(
-        "Pleins Phares 82",
+        "Découvrir Pleins Phares 82",
         "https://www.facebook.com/groups/656601229660372/",
         use_container_width=True,
     )
     st.caption("💾 Exportez votre itinéraire en GPX. Pour les pros, éditez votre roadbook.")
-    if st.button("🏁 Commencer", use_container_width=True):
-        st.session_state["bienvenue_vue"] = True
-        st.rerun()
+    st.write("Quel type de trajet souhaitez-vous préparer ?")
+    col_simple, col_boucle = st.columns(2)
+    with col_simple:
+        if st.button(
+            "➡️ Trajet simple",
+            help="Choisir un départ et une arrivée, avec une étape facultative.",
+            use_container_width=True,
+        ):
+            st.session_state["type_itineraire"] = "➡️ Aller simple"
+            st.session_state["bienvenue_vue"] = True
+            st.rerun()
+    with col_boucle:
+        if st.button(
+            "🔁 Balade en boucle",
+            help="Créer une balade qui revient au point de départ.",
+            use_container_width=True,
+        ):
+            st.session_state["type_itineraire"] = "🔁 Balade en boucle"
+            st.session_state["bienvenue_vue"] = True
+            st.rerun()
 
 
 if not st.session_state.get("bienvenue_vue", False):
@@ -259,7 +300,7 @@ def nommer_coordonnee(lat, lon):
 # ROUTING & DÉCOUPE DES PAUSES / STATIONS TOUS LES 200 KM
 # -----------------------------------------------------------------------------
 def router_sans_autoroute(waypoints, zones_a_eviter=None):
-    """Itinéraire BRouter, sans autoroutes ni voies express assimilées."""
+    """Itinéraire sans autoroute, avec GraphHopper en secours de BRouter."""
     url = "https://brouter.de/brouter"
     params = {
         "lonlats": "|".join(f"{lon},{lat}" for lat, lon in waypoints),
@@ -277,7 +318,7 @@ def router_sans_autoroute(waypoints, zones_a_eviter=None):
         )
 
     erreurs = []
-    for _ in range(2):
+    for tentative in range(3):
         try:
             resp = requests.get(
                 url,
@@ -300,10 +341,35 @@ def router_sans_autoroute(waypoints, zones_a_eviter=None):
                 float(props["total-time"]) / 60.0,
                 None,
             )
-        except (requests.RequestException, ValueError, KeyError) as exc:
-            erreurs.append(str(exc))
+        except requests.HTTPError as exc:
+            statut = exc.response.status_code if exc.response is not None else "inconnu"
+            erreurs.append(f"HTTP {statut}")
+            # Les erreurs 4xx autres que la limitation 429 ne disparaîtront
+            # généralement pas avec une nouvelle tentative.
+            if isinstance(statut, int) and 400 <= statut < 500 and statut != 429:
+                break
+        except requests.Timeout:
+            erreurs.append("délai dépassé")
+        except requests.ConnectionError:
+            erreurs.append("connexion impossible")
+        except (ValueError, KeyError) as exc:
+            erreurs.append(f"réponse invalide ({exc})")
 
-    return None, 0, 0, "BRouter est temporairement indisponible. Réessayez dans un instant."
+        if tentative < 2:
+            # Les tentatives espacées absorbent les surcharges brèves du
+            # serveur public, notamment aux heures de forte utilisation.
+            time.sleep(1.5 * (tentative + 1))
+
+    secours = router_graphhopper_sans_autoroute(waypoints, zones_a_eviter)
+    if secours[0]:
+        return secours
+
+    detail_brouter = ", ".join(erreurs) or "erreur inconnue"
+    detail_graphhopper = secours[3] or "secours indisponible"
+    return None, 0, 0, (
+        f"BRouter est indisponible ({detail_brouter}). "
+        f"Le secours GraphHopper a également échoué : {detail_graphhopper}"
+    )
 
 
 def obtenir_cle_graphhopper():
@@ -322,6 +388,65 @@ def obtenir_cle_graphhopper():
         return str(st.secrets.get("GRAPHHOPPER_API_KEY", "")).strip()
     except Exception:
         return ""
+
+
+def router_graphhopper_sans_autoroute(waypoints, zones_a_eviter=None):
+    """Calcule un aller simple avec GraphHopper lorsque BRouter ne répond pas."""
+    cle_api = obtenir_cle_graphhopper()
+    if not cle_api:
+        return None, 0, 0, "clé administrateur GraphHopper absente."
+
+    payload = {
+        "points": [[lon, lat] for lat, lon in waypoints],
+        "profile": "car",
+        "points_encoded": False,
+        "elevation": True,
+        "locale": "fr",
+        "instructions": False,
+        "custom_model": {
+            "priority": [
+                {
+                    "if": "road_class == MOTORWAY || road_class == TRUNK || road_class == PRIMARY",
+                    "multiply_by": "0",
+                }
+            ]
+        },
+    }
+
+    # GraphHopper ne reprend pas directement les cercles `nogos` de BRouter.
+    # Ce secours reste donc réservé aux trajets classiques sans zones forcées.
+    if zones_a_eviter:
+        return None, 0, 0, "les zones à éviter ne sont pas compatibles avec le secours."
+
+    try:
+        response = requests.post(
+            "https://graphhopper.com/api/1/route",
+            params={"key": cle_api},
+            json=payload,
+            timeout=45,
+        )
+        data = response.json()
+        if response.status_code != 200 or not data.get("paths"):
+            return None, 0, 0, data.get(
+                "message", f"réponse HTTP {response.status_code}"
+            )
+
+        path = data["paths"][0]
+        coords = [
+            (point[1], point[0]) for point in path["points"]["coordinates"]
+        ]
+        return (
+            coords,
+            float(path["distance"]) / 1000.0,
+            float(path["time"]) / 60000.0,
+            None,
+        )
+    except requests.Timeout:
+        return None, 0, 0, "délai dépassé."
+    except requests.ConnectionError:
+        return None, 0, 0, "connexion impossible."
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        return None, 0, 0, f"réponse invalide ({exc})."
 
 
 def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
@@ -692,29 +817,91 @@ def obtenir_denivele_et_virages(coords):
     return denivele_pos, denivele_neg, pct_virages, elevations
 
 
-def chercher_pistes_trail_overpass(center_lat, center_lon, rayon_m=15000):
-    query = f"""
-    [out:json][timeout:8];
-    (
-      way["highway"="track"](around:{rayon_m},{center_lat},{center_lon});
-      way["surface"~"unpaved|compacted|gravel|dirt|earth"](around:{rayon_m},{center_lat},{center_lon});
-    );
-    out body geom 30;
-    """
-    url = "https://overpass-api.de/api/interpreter"
-    try:
-        resp = requests.post(url, data={"data": query}, timeout=8)
-        if resp.status_code == 200:
-            elements = resp.json().get("elements", [])
-            pistes_coords = []
-            for el in elements:
-                if "geometry" in el:
-                    piste = [(pt["lat"], pt["lon"]) for pt in el["geometry"]]
-                    pistes_coords.append(piste)
-            return pistes_coords
-    except Exception:
-        pass
-    return []
+@st.cache_data(ttl=3600, show_spinner=False)
+def chercher_pistes_trail_overpass(coords, rayon_m=2500, intervalle_km=25):
+    """Recherche des pistes OSM praticables sans interdiction moto explicite."""
+    if not coords:
+        return [], "Tracé indisponible pour rechercher les pistes."
+
+    # Répartit la recherche sur tout le parcours au lieu de se limiter à son
+    # point central. Le plafond protège les serveurs Overpass publics.
+    points = [coords[0]]
+    distance = 0.0
+    for i in range(1, len(coords)):
+        distance += haversine_distance(coords[i - 1], coords[i]) / 1000
+        if distance >= intervalle_km:
+            points.append(coords[i])
+            distance = 0.0
+    if points[-1] != coords[-1]:
+        points.append(coords[-1])
+    # Vingt zones suffisent pour donner un aperçu fiable tout en maintenant
+    # le calcul de l'itinéraire sous quelques secondes dans la plupart des cas.
+    points = points[:20]
+
+    surfaces_trail = (
+        "unpaved|compacted|fine_gravel|gravel|pebblestone|dirt|earth|ground"
+    )
+    zones = "".join(
+        f'way["highway"~"^(track|unclassified)$"]'
+        f'["surface"~"^({surfaces_trail})$"]'
+        f'(around:{rayon_m},{lat},{lon});'
+        for lat, lon in points
+    )
+    query = f"[out:json][timeout:12];({zones});out body geom 120;"
+
+    data = None
+    for url in (
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ):
+        try:
+            response = requests.get(
+                url,
+                params={"data": query},
+                headers={"User-Agent": "ROADRIC/1.0"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except (requests.RequestException, ValueError):
+            pass
+
+    if data is None:
+        return [], "La recherche des pistes est temporairement indisponible."
+
+    acces_interdits = {
+        "no", "private", "customers", "destination", "agricultural", "forestry"
+    }
+    etats_interdits = {"horrible", "very_horrible", "impassable"}
+    pistes, identifiants_vus = [], set()
+
+    for element in data.get("elements", []):
+        identifiant = element.get("id")
+        if identifiant in identifiants_vus or not element.get("geometry"):
+            continue
+        identifiants_vus.add(identifiant)
+        tags = element.get("tags", {})
+
+        # Une restriction plus précise (motorcycle) prime sur les restrictions
+        # générales access, vehicle et motor_vehicle.
+        if any(
+            tags.get(cle, "").lower() in acces_interdits
+            for cle in ("access", "vehicle", "motor_vehicle", "motorcycle")
+        ):
+            continue
+        if tags.get("tracktype", "").lower() in {"grade4", "grade5"}:
+            continue
+        if tags.get("smoothness", "").lower() in etats_interdits:
+            continue
+
+        piste = [(pt["lat"], pt["lon"]) for pt in element["geometry"]]
+        if len(piste) >= 2:
+            pistes.append(piste)
+
+    if not pistes:
+        return [], "Aucune piste non goudronnée compatible recensée près du tracé."
+    return pistes[:120], None
 
 
 def chercher_stations_essence_overpass(coords, rayon_m=8000, intervalle_km=12):
@@ -883,61 +1070,85 @@ def recommander_stations(stations, distance_totale_km, autonomie_km):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Configuration Itinéraire")
-
-    type_itineraire = st.radio(
-        "🧭 Type d'itinéraire",
-        options=["➡️ Aller simple", "🔁 Balade en boucle"],
-    )
-    categorie = st.radio(
-        "🎯 Mode de Pratique",
-        options=["🛣️ Routière / GT", "🏍️ Trail / Tout-terrain"],
-        help="Le mode Trail affiche en vert les chemins et pistes non goudronnées."
+    st.markdown(
+        '<div class="mobile-scroll-hint">⬇️ Faites défiler le menu pour '
+        "terminer la configuration</div>",
+        unsafe_allow_html=True,
     )
 
-    ville_depart = saisir_ville_avec_suggestions("📍 Ville de départ (Point A)", "Montbeton", "depart")
-    if st.button("📍 Choisir une rue précise", use_container_width=True):
-        choisir_depart_precis(ville_depart)
-    depart_precis = st.session_state.get("depart_precis")
-    if depart_precis and depart_precis.get("ville_source") == ville_depart:
-        st.caption(f"Départ retenu : {depart_precis['label']}")
-    est_boucle = "boucle" in type_itineraire
-    if est_boucle:
-        duree_boucle_h = st.slider(
-            "⏱️ Durée de roulage souhaitée (en heures)",
-            min_value=1.0,
-            max_value=8.0,
-            value=3.0,
-            step=0.5,
-            help="Le moteur spécialisé génère un circuit au plus près de cette durée.",
+    with st.expander("1️⃣ Type de trajet", expanded=True):
+        type_itineraire = st.radio(
+            "🧭 Type d'itinéraire",
+            options=["➡️ Aller simple", "🔁 Balade en boucle"],
+            key="type_itineraire",
         )
-        direction_boucle = st.radio(
-            "🧭 Direction principale de la boucle",
-            options=["⬆️ Nord", "➡️ Est", "⬇️ Sud", "⬅️ Ouest"],
-            horizontal=True,
+        categorie = st.radio(
+            "🎯 Mode de Pratique",
+            options=["🛣️ Routière / GT", "🏍️ Trail / Tout-terrain"],
+            help=(
+                "Le mode Trail affiche les pistes non goudronnées sans interdiction "
+                "moto explicite dans OpenStreetMap."
+            ),
         )
-        st.caption("Circuit automatique, départ et arrivée identiques.")
-        etape_intermediaire = ""
-        ville_arrivee = ville_depart
-    else:
-        duree_boucle_h = None
-        direction_boucle = None
-        ajouter_etape = st.checkbox("➕ Ajouter une étape intermédiaire")
-        etape_intermediaire = (
-            saisir_ville_avec_suggestions("📌 Étape intermédiaire", "Auch", "etape")
-            if ajouter_etape
-            else ""
-        )
-        ville_arrivee = saisir_ville_avec_suggestions("🏁 Ville d'arrivée (Point B)", "Lourdes", "arrivee")
-        if st.button("🏁 Choisir une rue d'arrivée", use_container_width=True):
-            choisir_arrivee_precise(ville_arrivee)
-        arrivee_precise = st.session_state.get("arrivee_precise")
-        if arrivee_precise and arrivee_precise.get("ville_source") == ville_arrivee:
-            st.caption(f"Arrivée retenue : {arrivee_precise['label']}")
 
-    heure_depart = st.time_input("🕒 Heure de départ", datetime.time(9, 0), step=900)
-    autonomie_km = st.slider("⛽ Autonomie réservoir / Plein (km)", 150, 350, 200, step=10)
+    with st.expander("2️⃣ Départ et arrivée", expanded=True):
+        ville_depart = saisir_ville_avec_suggestions(
+            "📍 Ville de départ (Point A)", "Montbeton", "depart"
+        )
+        if st.button("📍 Choisir une rue précise", use_container_width=True):
+            choisir_depart_precis(ville_depart)
+        depart_precis = st.session_state.get("depart_precis")
+        if depart_precis and depart_precis.get("ville_source") == ville_depart:
+            st.caption(f"Départ retenu : {depart_precis['label']}")
 
-    btn_generer = st.button("🚀 Calculer l'Itinéraire", use_container_width=True)
+        est_boucle = "boucle" in type_itineraire
+        if est_boucle:
+            duree_boucle_h = st.slider(
+                "⏱️ Durée de roulage souhaitée (en heures)",
+                min_value=1.0,
+                max_value=8.0,
+                value=3.0,
+                step=0.5,
+                help="Le moteur spécialisé génère un circuit au plus près de cette durée.",
+            )
+            direction_boucle = st.radio(
+                "🧭 Direction principale de la boucle",
+                options=["⬆️ Nord", "➡️ Est", "⬇️ Sud", "⬅️ Ouest"],
+                horizontal=True,
+            )
+            st.caption("Circuit automatique, départ et arrivée identiques.")
+            etape_intermediaire = ""
+            ville_arrivee = ville_depart
+        else:
+            duree_boucle_h = None
+            direction_boucle = None
+            ajouter_etape = st.checkbox("➕ Ajouter une étape intermédiaire")
+            etape_intermediaire = (
+                saisir_ville_avec_suggestions("📌 Étape intermédiaire", "Auch", "etape")
+                if ajouter_etape
+                else ""
+            )
+            ville_arrivee = saisir_ville_avec_suggestions(
+                "🏁 Ville d'arrivée (Point B)", "Lourdes", "arrivee"
+            )
+            if st.button("🏁 Choisir une rue d'arrivée", use_container_width=True):
+                choisir_arrivee_precise(ville_arrivee)
+            arrivee_precise = st.session_state.get("arrivee_precise")
+            if arrivee_precise and arrivee_precise.get("ville_source") == ville_arrivee:
+                st.caption(f"Arrivée retenue : {arrivee_precise['label']}")
+
+    with st.expander("3️⃣ Horaires et autonomie", expanded=False):
+        heure_depart = st.time_input(
+            "🕒 Heure de départ", datetime.time(9, 0), step=900
+        )
+        autonomie_km = st.slider(
+            "⛽ Autonomie réservoir / Plein (km)", 150, 350, 200, step=10
+        )
+
+    with st.container(key="calcul_mobile_sticky"):
+        btn_generer = st.button(
+            "🚀 Calculer l'Itinéraire", use_container_width=True
+        )
     zone_export_gpx = st.empty()
     zone_roadbook = st.empty()
 
@@ -1000,10 +1211,11 @@ if btn_generer:
             if coords_trace:
                 d_pos, d_neg, pct_virages, elevations = obtenir_denivele_et_virages(coords_trace)
 
-                pistes_overlay = []
+                pistes_overlay, alerte_pistes = [], None
                 if is_trail:
-                    mid_pt = coords_trace[len(coords_trace) // 2]
-                    pistes_overlay = chercher_pistes_trail_overpass(mid_pt[0], mid_pt[1], rayon_m=20000)
+                    pistes_overlay, alerte_pistes = chercher_pistes_trail_overpass(
+                        coords_trace
+                    )
 
                 etapes_pauses, _ = calculer_étapes_pauses_et_plein(
                     coords_trace, dist_reelle, duree_min, heure_depart, intervalle_plein_km=autonomie_km
@@ -1041,6 +1253,7 @@ if btn_generer:
                     "duree_boucle_cible": duree_boucle_h,
                     "direction_boucle": direction_boucle,
                     "pistes": pistes_overlay,
+                    "alerte_pistes": alerte_pistes,
                     "coords_etape": coords_etape,
                     "d_pos": d_pos,
                     "d_neg": d_neg,
@@ -1073,6 +1286,14 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
             f"Objectif : environ {res['duree_boucle_cible']:.1f} h de roulage, "
             f"en partant vers {res['direction_boucle']}."
         )
+    if res["is_trail"]:
+        st.warning(
+            "⚠️ Les pistes vertes sont proposées d'après les données OpenStreetMap. "
+            "Elles ne font pas partie automatiquement du tracé bleu. Vérifiez leur "
+            "état et respectez toujours la signalisation sur place."
+        )
+        if res.get("alerte_pistes"):
+            st.info(f"ℹ️ {res['alerte_pistes']}")
 
     # Affichage sur 5 colonnes incluant désormais le % de virages
     with st.container(key="resume_metrics"):
@@ -1129,7 +1350,13 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
 
     if res["is_trail"] and res["pistes"]:
         for piste in res["pistes"]:
-            folium.PolyLine(locations=piste, color="#2e7d32", weight=4, opacity=0.9, popup="Piste / Chemin").add_to(m)
+            folium.PolyLine(
+                locations=piste,
+                color="#2e7d32",
+                weight=4,
+                opacity=0.9,
+                popup="Piste OSM non goudronnée — accès à vérifier sur place",
+            ).add_to(m)
 
     for p in res["etapes_pauses"]:
         folium.Marker(
