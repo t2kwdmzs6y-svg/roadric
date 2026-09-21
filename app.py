@@ -460,62 +460,6 @@ def router_graphhopper_secours(waypoints, zones_a_eviter=None):
         return None, 0, 0, f"réponse invalide ({exc})."
 
 
-def router_boucle_graphhopper(depart, duree_cible_min, cap_initial):
-    """Génère plusieurs circuits et conserve celui qui offre le plus de montée."""
-    cle_api = obtenir_cle_graphhopper()
-    if not cle_api:
-        return None, 0, 0, (
-            "Le mode boucle nécessite la clé administrateur GraphHopper. "
-            "Ajoutez GRAPHHOPPER_API_KEY dans le fichier .env."
-        ), []
-
-    distance_m = int(max(20000, min(300000, duree_cible_min / 60 * 45000)))
-    payload_base = {
-        "points": [[depart[1], depart[0]]],
-        "profile": "car",
-        "algorithm": "round_trip",
-        "round_trip.distance": distance_m,
-        "round_trip.seed": int(abs(depart[0] * 1000 + depart[1] * 10000 + cap_initial)),
-        # GraphHopper utilise ce cap pour orienter le début du circuit.
-        "heading": cap_initial,
-        "heading_penalty": 600,
-        "points_encoded": False,
-        "elevation": True,
-        "locale": "fr",
-    }
-    try:
-        candidates, erreurs = [], []
-        # Trois graines différentes : on garde le circuit qui offre le plus de montée.
-        for variation in range(3):
-            payload = payload_base.copy()
-            payload["round_trip.seed"] += variation * 7919
-            response = requests.post(
-                "https://graphhopper.com/api/1/route",
-                params={"key": cle_api},
-                json=payload,
-                timeout=45,
-            )
-            data = response.json()
-            if response.status_code == 200 and data.get("paths"):
-                path = data["paths"][0]
-                coords = [(point[1], point[0]) for point in path["points"]["coordinates"]]
-                candidates.append((path.get("ascend", 0), coords, path["distance"] / 1000.0, path["time"] / 60000.0, path.get("instructions", [])))
-            else:
-                erreurs.append(data.get("message", "réponse inattendue"))
-        if candidates:
-            _, coords, distance, duree, instructions = max(candidates, key=lambda candidat: candidat[0])
-            return coords, distance, duree, None, instructions
-        message = erreurs[0] if erreurs else "réponse inattendue"
-        if message == "Connection between locations not found":
-            message = (
-                "aucune boucle n'est possible sans emprunter un axe interdit depuis ce départ. "
-                "Essayez un départ placé sur une petite route."
-            )
-        return None, 0, 0, f"GraphHopper : {message}", []
-    except (requests.RequestException, ValueError, KeyError) as exc:
-        return None, 0, 0, f"Connexion à GraphHopper impossible : {exc}", []
-
-
 def point_a_distance(lat, lon, distance_km, cap_deg):
     """Calcule un point à une distance et un cap donnés depuis le départ."""
     rayon_terre_km = 6371.0
@@ -612,8 +556,66 @@ def chercher_villes_a_eviter(lat, lon, rayon_m):
         return []
 
 
-def calculer_boucle_sans_autoroute(depart, duree_cible_min):
-    """Construit une boucle et sélectionne la variante qui se croise le moins."""
+def supprimer_antennes(coords, seuil_m=60, detour_max_m=15000):
+    """Supprime les allers-retours (antennes) laissés par BRouter quand un
+    tronçon est bloqué par une zone interdite (ville, autoroute) : le tracé
+    s'engage alors dans une voie sans issue puis repasse par les mêmes
+    coordonnées avant de continuer. On repère ces retours sur un échantillon
+    du tracé, en se limitant à des détours locaux (`detour_max_m`) pour ne
+    jamais confondre une antenne avec le bouclage final de la balade sur son
+    point de départ. On retire ensuite l'aller-retour du tracé complet.
+    """
+    n = len(coords)
+    if n < 10:
+        return coords
+
+    pas = max(1, n // 400)
+    echantillon = list(range(0, n, pas))
+    if echantillon[-1] != n - 1:
+        echantillon.append(n - 1)
+
+    # Distance cumulée le long de l'échantillon, pour borner la recherche à
+    # des détours courts plutôt qu'à l'ensemble du tracé.
+    cumul = [0.0]
+    for i in range(1, len(echantillon)):
+        cumul.append(
+            cumul[-1] + haversine_distance(coords[echantillon[i - 1]], coords[echantillon[i]])
+        )
+
+    suppressions = []
+    k, m = 0, len(echantillon)
+    while k < m - 4:
+        idx_i = echantillon[k]
+        trouve = None
+        # Recherche du point le plus tardif, dans la limite du détour
+        # maximal autorisé, qui repasse près du point i.
+        for pos in range(m - 1, k + 4, -1):
+            if cumul[pos] - cumul[k] > detour_max_m:
+                continue
+            idx_j = echantillon[pos]
+            if haversine_distance(coords[idx_i], coords[idx_j]) <= seuil_m:
+                trouve = pos
+                break
+        if trouve is not None:
+            suppressions.append((idx_i, echantillon[trouve]))
+            k = trouve + 1
+        else:
+            k += 1
+
+    if not suppressions:
+        return coords
+
+    resultat, position = [], 0
+    for debut, fin in suppressions:
+        resultat.extend(coords[position:debut + 1])
+        position = fin
+    resultat.extend(coords[position:])
+    return resultat
+
+
+def calculer_boucle_sans_autoroute(depart, duree_cible_min, cap_initial=0):
+    """Construit une boucle sans autoroute ni traversée de ville, orientée
+    vers le cap demandé, puis retire les éventuelles antennes du tracé."""
     # 45 km/h est une moyenne adaptée à une balade sur des routes secondaires.
     distance_cible_km = duree_cible_min / 60 * 45
     rayon_km = max(8, min(85, distance_cible_km / 5.6))
@@ -622,21 +624,40 @@ def calculer_boucle_sans_autoroute(depart, duree_cible_min):
     )
 
     # Six points répartis sur le pourtour évitent les grandes branches qui se
-    # rejoignent au milieu : chaque côté du circuit est calculé séparément.
-    caps = (20, 80, 140, 200, 260, 320)
+    # rejoignent au milieu ; ils sont orientés à partir du cap choisi pour que
+    # la balade parte bien dans la direction demandée.
+    caps = tuple((cap_initial + decalage) % 360 for decalage in (0, 60, 120, 180, 240, 300))
     points_intermediaires = [
         point_a_distance(depart[0], depart[1], rayon_km, cap) for cap in caps
     ]
     waypoints = [depart, *points_intermediaires, depart]
     rayon_nogo_m = int(max(3500, min(20000, rayon_km * 700)))
-    resultat = router_boucle_par_troncons(
+    coords, distance_km, duree_min, erreur = router_boucle_par_troncons(
         waypoints,
         zones_a_eviter=[(depart[0], depart[1], rayon_nogo_m), *villes],
     )
-    coords, _, _, erreur = resultat
     if erreur or not coords:
-        return None, 0, 0, erreur or "Impossible de générer une boucle continue."
-    return resultat
+        return None, 0, 0, erreur or "Impossible de générer une boucle continue.", []
+
+    coords_nettoyes = supprimer_antennes(coords)
+    distance_nettoyee_km = sum(
+        haversine_distance(coords_nettoyes[i], coords_nettoyes[i + 1])
+        for i in range(len(coords_nettoyes) - 1)
+    ) / 1000
+
+    if distance_km and distance_nettoyee_km < distance_km * 0.5:
+        # Filet de sécurité : si le nettoyage retire une trop grande partie
+        # du tracé, on garde le tracé d'origine par prudence.
+        coords_finaux, distance_finale_km, duree_finale_min = coords, distance_km, duree_min
+    else:
+        coords_finaux = coords_nettoyes
+        distance_finale_km = distance_nettoyee_km
+        duree_finale_min = (
+            duree_min * (distance_finale_km / distance_km) if distance_km else duree_min
+        )
+
+    instructions = creer_instructions_traces(coords_finaux)
+    return coords_finaux, distance_finale_km, duree_finale_min, None, instructions
 
 
 def creer_gpx(coords, nom="Roadric - Road-trip moto"):
@@ -1226,7 +1247,7 @@ if btn_generer:
             is_trail = "Trail" in categorie
             if est_boucle:
                 caps_direction = {"⬆️ Nord": 0, "➡️ Est": 90, "⬇️ Sud": 180, "⬅️ Ouest": 270}
-                coords_trace, dist_reelle, duree_min, erreur_routage, instructions = router_boucle_graphhopper(
+                coords_trace, dist_reelle, duree_min, erreur_routage, instructions = calculer_boucle_sans_autoroute(
                     coords_dep, int(duree_boucle_h * 60), caps_direction[direction_boucle]
                 )
             else:
