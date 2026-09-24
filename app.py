@@ -1,5 +1,5 @@
 # =============================================================================
-# ROADRIC — Version 2026.08.23
+# ROADRIC — Version 2026.09.24 (météo allégée sur le trajet)
 # Principales évolutions : choix du trajet dès l'accueil, interface mobile
 # guidée, pauses programmées, recherche Trail sécurisée et optimisée,
 # secours GraphHopper compatible avec le forfait gratuit, statut SP98 des
@@ -1116,6 +1116,90 @@ def recommander_stations(stations, distance_totale_km, autonomie_km):
 
 
 # -----------------------------------------------------------------------------
+# MÉTÉO ALLÉGÉE (Open-Meteo, gratuit, sans clé)
+# -----------------------------------------------------------------------------
+METEO_ICONES = {
+    0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️", 45: "🌫️", 48: "🌫️",
+    51: "🌦️", 53: "🌦️", 55: "🌦️", 56: "🌧️", 57: "🌧️",
+    61: "🌧️", 63: "🌧️", 65: "🌧️", 66: "🌧️", 67: "🌧️",
+    71: "🌨️", 73: "🌨️", 75: "🌨️", 77: "🌨️",
+    80: "🌦️", 81: "🌧️", 82: "⛈️", 85: "🌨️", 86: "🌨️",
+    95: "⛈️", 96: "⛈️", 99: "⛈️",
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _appel_open_meteo(lats, lons):
+    reponse = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": ",".join(lats),
+            "longitude": ",".join(lons),
+            "hourly": "temperature_2m,precipitation_probability,weather_code,wind_speed_10m",
+            "timezone": "auto",
+            "forecast_days": 2,
+        },
+        timeout=10,
+    )
+    reponse.raise_for_status()
+    donnees = reponse.json()
+    return donnees if isinstance(donnees, list) else [donnees]
+
+
+def obtenir_meteo_trajet(coords, dt_dep, temps_total_min, nb_points=5):
+    """Météo à 5 points du trajet, à l'heure de passage estimée (1 seul appel)."""
+    if not coords or len(coords) < 2:
+        return [], None
+
+    # Distances cumulées pour placer les points à 0 %, 25 %, 50 %, 75 %, 100 %
+    cumul = [0.0]
+    for i in range(1, len(coords)):
+        cumul.append(cumul[-1] + haversine_distance(coords[i - 1], coords[i]))
+    total = cumul[-1] or 1.0
+
+    points = []
+    idx = 0
+    for k in range(nb_points):
+        ratio = k / (nb_points - 1)
+        while idx < len(cumul) - 1 and cumul[idx] < ratio * total:
+            idx += 1
+        lat, lon = coords[idx][0], coords[idx][1]
+        points.append({
+            "lat": lat,
+            "lon": lon,
+            "km": round(cumul[idx] / 1000, 1),
+            "dt": dt_dep + datetime.timedelta(minutes=ratio * temps_total_min),
+        })
+
+    try:
+        reponses = _appel_open_meteo(
+            tuple(f"{p['lat']:.3f}" for p in points),
+            tuple(f"{p['lon']:.3f}" for p in points),
+        )
+    except Exception:
+        return [], "Météo indisponible pour le moment."
+
+    meteo = []
+    for p, rep in zip(points, reponses):
+        horaire = rep.get("hourly", {})
+        heures = horaire.get("time", [])
+        cle = p["dt"].strftime("%Y-%m-%dT%H:00")
+        if cle not in heures:
+            continue
+        j = heures.index(cle)
+        meteo.append({
+            "km": p["km"],
+            "heure": p["dt"].strftime("%Hh%M"),
+            "lieu": nommer_coordonnee(p["lat"], p["lon"]),
+            "icone": METEO_ICONES.get(horaire["weather_code"][j], "🌡️"),
+            "temp": round(horaire["temperature_2m"][j]),
+            "pluie": horaire["precipitation_probability"][j] or 0,
+            "vent": round(horaire["wind_speed_10m"][j]),
+        })
+    return meteo, None if meteo else "Météo indisponible pour cet horaire."
+
+
+# -----------------------------------------------------------------------------
 # BARRE LATÉRALE
 # -----------------------------------------------------------------------------
 with st.sidebar:
@@ -1289,6 +1373,9 @@ if btn_generer:
                 dt_dep = datetime.datetime.combine(datetime.date.today(), heure_depart)
                 temps_total_min = duree_min + (len(etapes_pauses) * 20) + 45
                 dt_arr = dt_dep + datetime.timedelta(minutes=temps_total_min)
+                meteo_trajet, alerte_meteo = obtenir_meteo_trajet(
+                    coords_trace, dt_dep, temps_total_min
+                )
 
                 st.session_state["trajet_resultat"] = {
                     "coords": coords_trace,
@@ -1313,7 +1400,9 @@ if btn_generer:
                     "alertes_carburant": alertes_carburant,
                     "points_interet": points_interet,
                     "instructions": instructions,
-                    "elevations": elevations
+                    "elevations": elevations,
+                    "meteo": meteo_trajet,
+                    "alerte_meteo": alerte_meteo,
                 }
                 st.session_state["gpx_exporte"] = False
                 st.session_state["roadbook_affiche"] = False
@@ -1353,6 +1442,33 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
         c3.metric("🏁 Arrivée Estimée", res["heure_arr"], help="Inclut les pauses café + repas")
         c4.metric("🔄 Courbes & Virages", f"{res['pct_virages']}%")
         c5.metric("🏔️ Dénivelé (+ / -)", f"+{res['d_pos']}m / -{res['d_neg']}m")
+
+    # MÉTÉO ALLÉGÉE SUR LE TRAJET
+    if res.get("meteo"):
+        st.markdown("**🌦️ Météo sur le trajet** (heure de passage estimée)")
+        cols_meteo = st.columns(len(res["meteo"]))
+        for col, mt in zip(cols_meteo, res["meteo"]):
+            col.markdown(
+                f"<div style='text-align:center;line-height:1.35'>"
+                f"<span style='font-size:1.6em'>{mt['icone']}</span><br>"
+                f"<b>{mt['temp']}°C</b><br>"
+                f"💧 {mt['pluie']}% · 💨 {mt['vent']} km/h<br>"
+                f"<small>{mt['heure']} · km {mt['km']}<br>{escape(mt['lieu'])}</small>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        pluie_max = max(mt["pluie"] for mt in res["meteo"])
+        vent_max = max(mt["vent"] for mt in res["meteo"])
+        temp_min = min(mt["temp"] for mt in res["meteo"])
+        if pluie_max >= 50:
+            st.warning(f"🌧️ Risque de pluie jusqu'à {pluie_max}% : prévoir l'équipement pluie.")
+        if vent_max >= 50:
+            st.warning(f"💨 Vent fort annoncé (jusqu'à {vent_max} km/h).")
+        if temp_min <= 3:
+            st.warning(f"🥶 Températures basses ({temp_min}°C) : attention au verglas.")
+        st.caption("Prévisions Open-Meteo, à revérifier avant le départ.")
+    elif res.get("alerte_meteo"):
+        st.caption(f"🌦️ {res['alerte_meteo']}")
 
     st.markdown("---")
 
