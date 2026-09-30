@@ -131,6 +131,7 @@ def afficher_bienvenue():
     st.markdown(
         "- **Aller simple** : choisissez un départ, une arrivée et, si besoin, une étape.\n"
         "- **Balade en boucle** : indiquez une durée et une direction.\n"
+        "- **Sorties des clubs** : trouvez une sortie en groupe ou annoncez celle de votre club.\n"
         "- Les autoroutes sont évitées autant que possible pour privilégier les routes de balade."
     )
     st.markdown("---")
@@ -165,10 +166,23 @@ def afficher_bienvenue():
             st.session_state["type_itineraire"] = "🔁 Balade en boucle"
             st.session_state["bienvenue_vue"] = True
             st.rerun()
+    st.write("Envie de rouler en groupe ?")
+    if st.button(
+        "🏁 Sorties des clubs moto",
+        help="Voir les prochaines sorties des clubs ou annoncer celle de votre club.",
+        use_container_width=True,
+    ):
+        st.session_state["sorties_en_tete"] = True
+        st.session_state["bienvenue_vue"] = True
+        st.rerun()
 
 
 if not st.session_state.get("bienvenue_vue", False):
     afficher_bienvenue()
+
+# Emplacement en haut de page : la section des sorties y est affichée quand le
+# visiteur l'a choisie depuis l'accueil (elle est remplie en fin de script).
+zone_sorties_en_tete = st.container()
 
 # -----------------------------------------------------------------------------
 # FONCTIONS DE GÉOCODAGE ET CALCULS
@@ -1832,8 +1846,16 @@ def afficher_sorties_clubs():
                         st.error("L'envoi a échoué. Merci de réessayer dans quelques instants.")
 
 
-st.markdown("---")
-afficher_sorties_clubs()
+if st.session_state.get("sorties_en_tete"):
+    with zone_sorties_en_tete:
+        afficher_sorties_clubs()
+        if st.button("🏍️ Préparer plutôt un itinéraire", use_container_width=True):
+            st.session_state["sorties_en_tete"] = False
+            st.rerun()
+        st.markdown("---")
+else:
+    st.markdown("---")
+    afficher_sorties_clubs()
 
 
 st.markdown("---")
