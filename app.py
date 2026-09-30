@@ -1,10 +1,11 @@
 # =============================================================================
-# ROADRIC — Version 2026.09.24 (météo allégée sur le trajet)
+# ROADRIC — Version 2026.09.30 (sorties des clubs moto)
 # Principales évolutions : choix du trajet dès l'accueil, interface mobile
 # guidée, pauses programmées, recherche Trail sécurisée et optimisée,
 # secours GraphHopper compatible avec le forfait gratuit, statut SP98 des
 # stations, contenu SEO, partenaires et contact ROADRIC. Sont également
 # disponibles les boucles, points d'intérêt, exports GPX et roadbooks.
+# Nouveau : les clubs peuvent signaler leurs sorties (Google Sheets + validation).
 # =============================================================================
 
 import datetime
@@ -1591,6 +1592,248 @@ if "trajet_resultat" in st.session_state and st.session_state["trajet_resultat"]
 
 else:
     st.info("👈 Saisissez vos villes dans la barre latérale et cliquez sur **🚀 Calculer l'Itinéraire**.")
+
+
+
+# -----------------------------------------------------------------------------
+# SORTIES DES CLUBS MOTO (stockage Google Sheets, validation par ROADRIC)
+# -----------------------------------------------------------------------------
+REGIONS_FRANCE = [
+    "Auvergne-Rhône-Alpes",
+    "Bourgogne-Franche-Comté",
+    "Bretagne",
+    "Centre-Val de Loire",
+    "Corse",
+    "Grand Est",
+    "Hauts-de-France",
+    "Île-de-France",
+    "Normandie",
+    "Nouvelle-Aquitaine",
+    "Occitanie",
+    "Pays de la Loire",
+    "Provence-Alpes-Côte d'Azur",
+    "Outre-mer",
+    "Hors de France",
+]
+
+COLONNES_SORTIES = [
+    "Envoyée le",
+    "Date",
+    "Heure",
+    "Club",
+    "Région",
+    "Lieu de rendez-vous",
+    "Description",
+    "Email",
+    "Facebook",
+    "Validée",
+]
+
+JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+MOIS_FR = [
+    "janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+    "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+
+def _echapper_markdown(texte):
+    """Empêche un texte saisi par un visiteur d'être interprété en Markdown."""
+    texte = str(texte or "")
+    for caractere in "\\`*_{}[]()#+-.!|<>~$":
+        texte = texte.replace(caractere, "\\" + caractere)
+    return texte
+
+
+def _date_fr(jour):
+    return f"{JOURS_FR[jour.weekday()].capitalize()} {jour.day} {MOIS_FR[jour.month - 1]} {jour.year}"
+
+
+@st.cache_resource(show_spinner=False)
+def _feuille_sorties():
+    """Ouvre la feuille Google Sheets des sorties (None si non configurée)."""
+    try:
+        import gspread
+
+        infos_compte = dict(st.secrets["gcp_service_account"])
+        id_feuille = str(st.secrets["SORTIES_SHEET_ID"]).strip()
+    except Exception:
+        return None
+    client = gspread.service_account_from_dict(infos_compte)
+    feuille = client.open_by_key(id_feuille).sheet1
+    if feuille.row_values(1) != COLONNES_SORTIES:
+        feuille.update([COLONNES_SORTIES], "A1")
+    return feuille
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_sorties_validees():
+    """Renvoie les sorties validées à venir, triées par date."""
+    feuille = _feuille_sorties()
+    if feuille is None:
+        return None
+    aujourd_hui = datetime.date.today()
+    sorties = []
+    for ligne in feuille.get_all_records(expected_headers=COLONNES_SORTIES):
+        if str(ligne.get("Validée", "")).strip().lower() not in ("oui", "x", "ok", "true", "vrai"):
+            continue
+        try:
+            jour = datetime.date.fromisoformat(str(ligne.get("Date", "")).strip())
+        except ValueError:
+            continue
+        if jour < aujourd_hui:
+            continue
+        ligne["_jour"] = jour
+        sorties.append(ligne)
+    sorties.sort(key=lambda s: (s["_jour"], str(s.get("Heure", ""))))
+    return sorties
+
+
+def _email_valide(email):
+    import re
+
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", email))
+
+
+def _facebook_valide(lien):
+    import re
+
+    return bool(re.match(r"^https?://([a-z0-9-]+\.)?(facebook\.com|fb\.com|fb\.me)/\S+$", lien, re.I))
+
+
+def afficher_sortie(sortie):
+    with st.container(border=True):
+        heure = str(sortie.get("Heure", "")).strip()
+        st.markdown(
+            f"**📅 {_date_fr(sortie['_jour'])}{' à ' + _echapper_markdown(heure) if heure else ''}**  \n"
+            f"🏍️ **{_echapper_markdown(sortie.get('Club'))}** · "
+            f"📍 {_echapper_markdown(sortie.get('Lieu de rendez-vous'))} "
+            f"({_echapper_markdown(sortie.get('Région'))})"
+        )
+        description = str(sortie.get("Description", "")).strip()
+        if description:
+            st.markdown(_echapper_markdown(description))
+        email = str(sortie.get("Email", "")).strip()
+        facebook = str(sortie.get("Facebook", "")).strip()
+        col_mail, col_fb = st.columns(2)
+        if email and _email_valide(email):
+            with col_mail:
+                st.link_button(
+                    "📧 Contacter le club",
+                    f"mailto:{email}?subject=Sortie%20vue%20sur%20ROADRIC",
+                    use_container_width=True,
+                )
+        if facebook and _facebook_valide(facebook):
+            with col_fb:
+                st.link_button("👍 Page Facebook", facebook, use_container_width=True)
+
+
+def afficher_sorties_clubs():
+    st.subheader("🏁 Sorties des clubs moto")
+    st.write(
+        "Envie de rouler en groupe ? Retrouvez les prochaines sorties proposées "
+        "par les clubs et associations moto, ou annoncez celle de votre club."
+    )
+    onglet_liste, onglet_signaler = st.tabs(["📅 Prochaines sorties", "📣 Signaler une sortie"])
+
+    with onglet_liste:
+        try:
+            sorties = lire_sorties_validees()
+        except Exception:
+            sorties = None
+            st.warning("Les sorties des clubs sont momentanément indisponibles.")
+        if sorties is None:
+            st.info("La liste des sorties sera bientôt disponible.")
+        else:
+            region_choisie = st.selectbox(
+                "Filtrer par région",
+                ["Toutes les régions"] + REGIONS_FRANCE,
+                key="sorties_region",
+            )
+            if region_choisie != "Toutes les régions":
+                sorties = [s for s in sorties if s.get("Région") == region_choisie]
+            if not sorties:
+                st.caption("Aucune sortie annoncée pour le moment dans cette région.")
+            for sortie in sorties[:30]:
+                afficher_sortie(sortie)
+
+    with onglet_signaler:
+        st.caption(
+            "Votre annonce sera publiée après une rapide vérification par ROADRIC. "
+            "Indiquez au moins un e-mail ou une page Facebook pour être contacté."
+        )
+        with st.form("form_sortie_club", clear_on_submit=True):
+            club = st.text_input("Nom du club ou de l'association *", max_chars=80)
+            col_date, col_heure = st.columns(2)
+            with col_date:
+                jour = st.date_input(
+                    "Date de la sortie *",
+                    min_value=datetime.date.today(),
+                    format="DD/MM/YYYY",
+                )
+            with col_heure:
+                heure = st.time_input("Heure de départ", value=datetime.time(9, 0), step=900)
+            region = st.selectbox("Région *", REGIONS_FRANCE, index=None, placeholder="Choisir une région")
+            lieu = st.text_input("Lieu de rendez-vous (ville, parking…) *", max_chars=100)
+            description = st.text_area(
+                "Description (parcours, niveau, nombre de km, repas…)",
+                max_chars=600,
+            )
+            email = st.text_input("E-mail de contact", max_chars=120)
+            facebook = st.text_input("Lien de la page Facebook", placeholder="https://www.facebook.com/…", max_chars=200)
+            envoye = st.form_submit_button("📣 Proposer la sortie", use_container_width=True)
+
+        if envoye:
+            email, facebook = email.strip(), facebook.strip()
+            erreurs = []
+            if not club.strip():
+                erreurs.append("le nom du club")
+            if not region:
+                erreurs.append("la région")
+            if not lieu.strip():
+                erreurs.append("le lieu de rendez-vous")
+            if not email and not facebook:
+                erreurs.append("un e-mail ou un lien Facebook")
+            if email and not _email_valide(email):
+                erreurs.append("un e-mail valide")
+            if facebook and not _facebook_valide(facebook):
+                erreurs.append("un lien Facebook valide (https://www.facebook.com/…)")
+            dernier_envoi = st.session_state.get("sortie_dernier_envoi", 0)
+            if erreurs:
+                st.error("Merci d'indiquer " + ", ".join(erreurs) + ".")
+            elif time.time() - dernier_envoi < 60:
+                st.warning("Merci de patienter une minute avant de proposer une autre sortie.")
+            else:
+                feuille = _feuille_sorties()
+                if feuille is None:
+                    st.error("L'envoi des sorties n'est pas encore activé. Réessayez bientôt.")
+                else:
+                    try:
+                        feuille.append_row(
+                            [
+                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                jour.isoformat(),
+                                heure.strftime("%H:%M") if heure else "",
+                                club.strip(),
+                                region,
+                                lieu.strip(),
+                                description.strip(),
+                                email,
+                                facebook,
+                                "",
+                            ],
+                            value_input_option="RAW",
+                        )
+                        st.session_state["sortie_dernier_envoi"] = time.time()
+                        st.success(
+                            "Merci ! Votre sortie a bien été envoyée. Elle apparaîtra "
+                            "dans la liste dès qu'elle aura été validée."
+                        )
+                    except Exception:
+                        st.error("L'envoi a échoué. Merci de réessayer dans quelques instants.")
+
+
+st.markdown("---")
+afficher_sorties_clubs()
 
 
 st.markdown("---")
