@@ -2,3 +2,5 @@ streamlit
 streamlit-folium
 requests
 streamlit-searchbox
+gspread
+google-auth
